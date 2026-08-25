@@ -56,13 +56,17 @@ network
 
 The whole server is one value. Connections, the sessions on each connection,
 the trees on each session, the handles on each tree, the send and receive
-buffers: all fixed-size arrays inside one `Server(limits)` struct that lives in
-`main`'s frame. Nothing allocates after startup, so the memory ceiling is a
-compile-time constant — the daemon prints it on the way up.
+buffers: all fixed-size arrays inside one `Server(limits)` struct. Nothing
+allocates, ever — not at startup either — so the memory ceiling is a
+compile-time constant, and the daemon prints it on the way up.
 
 ```
-[info] easysambad listening on *:445 (epoll backend, 32 connections max, 34 MiB resident)
+[info] easysambad listening on *:445 (epoll backend, 32 connections max, 34 MiB ceiling)
 ```
+
+That is the ceiling, not the bill. The tables are reserved but never written
+until a client arrives to use them, so an idle daemon holds about 2 MiB and
+grows from there. [Performance](#performance) has the measurements.
 
 One thread multiplexes every connection through `epoll` on Linux, `kqueue` on
 macOS, `poll` anywhere else (`-Dpoll` forces it). A connection stops being read
@@ -126,9 +130,50 @@ natural place to extend it.
 
 ## Performance
 
-Two things were measured, because they answer different questions.
+### What it costs the machine
 
-**Through a real client**, macOS `mount_smbfs` over loopback, 200 MB with a warm
+`test/footprint.sh` mounts the share with the OS's own client, moves a gigabyte
+through it, and reports what the daemon held and burned while doing it. Both
+columns are the same laptop — the Linux one inside a container, which is why its
+write figure is an overlay filesystem's and not a disk's.
+
+| | macOS (arm64) | Linux (static musl, arm64) |
+|-|-|-|
+| binary on disk | 297 KiB | 345 KiB |
+| resident, idle | 1.6 MiB | 2.5 MiB |
+| resident, one client, 1 GiB moved | 2.5 MiB | 3.2 MiB |
+| reserved ceiling | 34 MiB | 34 MiB |
+| CPU per GiB read | 200 ms | 140 ms |
+| CPU per GiB written | 360 ms | 640 ms |
+
+The gap between 34 MiB reserved and 2.5 MiB held is the whole point of the
+fixed-table design, and it is easy to lose. Writing one byte into each of the 32
+connection slots at startup — which is all `init` used to do — made the entire
+pool resident, because Linux backs an anonymous fault with a 2 MiB huge page and
+the slots are a megabyte apart. The daemon started out holding 35 MiB of memory
+it was not using. Nothing now touches a connection slot until a client occupies
+it.
+
+Syscalls, counted with `strace -c` while serving 256 MiB as 1024 reads of
+256 KiB:
+
+```
+ 47.24    0.048161          47      1024           pread64
+ 38.83    0.039591          38      1028           write
+  6.88    0.007014          13       516           read
+  6.77    0.006901          13       516           epoll_pwait
+```
+
+Three syscalls per request, and none of them spare: one `pread` to get the data,
+one `write` to send it, and one socket read and one `epoll_pwait` shared between
+every two requests the client pipelines. There is no `epoll_ctl` in the list at
+all — a connection's poller registration is only rewritten when what it is
+waiting for actually changes, which for a client that is reading steadily is
+never.
+
+### Throughput
+
+Through a real client, macOS `mount_smbfs` over loopback, 200 MB with a warm
 cache:
 
 | max I/O | read | write | daemon CPU for 400 MB |
@@ -145,30 +190,52 @@ zig build -Dmax-io=1024 -Dconnections=8    # fewer, fatter connections
 zig build -Dmax-io=64  -Dconnections=128   # many small ones
 ```
 
-**The dispatch path itself**, in process, no sockets (`zig build bench
--Doptimize=ReleaseFast`, Apple M-series):
+### The server's own path
+
+`zig build bench -Doptimize=ReleaseFast` runs the real server against a real
+share with the real wire format and no socket in between, so what it times is
+the part this project can actually make faster.
 
 ```
 posixfs share
   operation                               ops/sec     throughput
-  echo (dispatch floor)                  18386877              -
-  create + close                           111472              -
-  create+query_info+close (1 frame)        105434              -
-  query_info (FileAllInformation)         2128587              -
-  query_directory (34 entries)              15300              -
-  read 64 KiB                              528357    33022 MiB/s
-  write 64 KiB                             185796    11612 MiB/s
-  read 64 KiB, signed                       34857     2179 MiB/s
+  echo (dispatch floor)                  18944040              -
+  create + close                           113320              -
+  create+query_info+close (1 frame)        109467              -
+  query_info (FileAllInformation)         2183880              -
+  query_directory (34 entries)              15309              -
+  read 4 KiB                              1920440     7502 MiB/s
+  read 64 KiB                              524422    32776 MiB/s
+  read 512 KiB                              67985    33992 MiB/s
+  write 64 KiB                             191620    11976 MiB/s
+  echo, 64 pipelined                     27005705              -
+  read 64 KiB, 32 pipelined                469687    29355 MiB/s
+  read 64 KiB, signed                       35097     2194 MiB/s
 ```
 
-What that says: the protocol layer is not the bottleneck for anything, the
-filesystem syscalls dominate metadata operations, and **signing costs about 15×
-on bulk reads** — it is HMAC-SHA256 over every byte, and it is what a Windows 11
-client asks for by default.
+Absolute numbers move with the machine and with what else it is doing; run it
+yourself. The shape is what matters, and it is stable:
 
-Blocking file I/O on the one thread is the shape of this design: a share backed
-by something slow stalls every client for as long as it is slow. Cold reads from
-a disk are disk-bound, and the daemon sits idle inside `pread` while they are.
+* The protocol layer is not the bottleneck for anything. A read at 32 GiB/s
+  through the dispatcher is one `memcpy` away from the memory bandwidth
+  ceiling — there is no headroom left to win there.
+* Filesystem syscalls dominate metadata operations. A `create + close` costs
+  nineteen times what a `query_info` on an already-open handle does, and the
+  difference is `openat` and `close`, not anything this code does.
+* **Signing costs about 15× on bulk reads.** It is HMAC-SHA256 over every
+  byte, and it is what a Windows 11 client asks for by default.
+* The `pipelined` rows go through the connection's buffers rather than
+  straight into the dispatcher, which is the path a socket takes: framing, the
+  input cursor, and the pause and resume of a full output buffer. Pipelining
+  buys about 40% on small requests by amortising the per-wakeup work.
+
+Two things deliberately left on the table. `sendfile`/`splice` would remove one
+of the two copies on a read, but it cannot sign what it never sees, it cannot be
+compounded with anything, and it would need the share adapter to hand out a file
+descriptor — which the adapter interface exists specifically to avoid requiring.
+And file I/O blocks the one thread: a share backed by something slow stalls
+every client for as long as it is slow. Cold reads from a disk are disk-bound,
+and the daemon sits idle inside `pread` while they are.
 
 ## What it speaks
 
@@ -221,11 +288,12 @@ silence:
 
 ```sh
 zig build                                # zig-out/bin/easysambad
-zig build test                           # 138 unit and protocol tests
+zig build test                           # 139 unit and protocol tests
 zig build check -Dtarget=x86_64-linux    # type-check another platform's backend
 zig build bench -Doptimize=ReleaseFast   # the numbers above
 test/integration.sh                      # mount it for real and use it
 test/docker-linux.sh                     # same, on Linux, both clients
+test/footprint.sh                        # memory and CPU while serving a GiB
 ```
 
 The tests are the protocol, not a mock of it. `src/server/LoopbackClient.zig` is
@@ -239,6 +307,7 @@ MS-FSCC.
 
 `test/integration.sh` is the one that catches what unit tests cannot — it mounts
 the share with the operating system's own client and checks the bytes that come
-back. Two of the bugs in this repo's history were only ever visible there: a
-missing transport header, and a `FileAllInformation` record one byte shorter
-than the Linux client accepts.
+back. Three of the bugs in this repo's history were only ever visible there: a
+missing transport header, a `FileAllInformation` record one byte shorter than
+the Linux client accepts, and a startup path that made 35 MiB resident before
+the first client connected.

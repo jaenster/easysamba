@@ -36,9 +36,8 @@ pub fn LoopbackClient(comptime ServerType: type) type {
 
         const Self = @This();
 
-        pub fn init(server: *ServerType, conn: *ServerType.Conn, scratch: []u8) Self {
-            conn.* = .{ .active = true, .token = 0 };
-            return .{ .server = server, .conn = conn, .scratch = scratch };
+        pub fn init(server: *ServerType, slot: usize, scratch: []u8) Self {
+            return .{ .server = server, .conn = server.adopt(slot), .scratch = scratch };
         }
 
         /// Sends one request and returns the response message, without the
@@ -65,6 +64,29 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             c.conn.out_len = 0;
             c.server.handleFrame(c.conn, message);
             return frameBody(c.conn.out[0..c.conn.out_len]);
+        }
+
+        /// Writes one complete transport-framed request into `out` and returns
+        /// how many bytes it took. This is what `send` does minus the handing
+        /// over, so a caller can build a pipeline of several and give them to
+        /// `Server.feed` in one go — which is the path a real socket takes and
+        /// `handleFrame` does not.
+        pub fn buildFrame(c: *Self, command: hdr.Command, body: []const u8, out: []u8) usize {
+            var w = wire.Writer.init(out);
+            w.zeroes(hdr.transport_header_size) catch unreachable;
+            c.message_id += 1;
+            hdr.write(&w, .{
+                .command = command,
+                .credits = 64,
+                .message_id = c.message_id,
+                .session_id = c.session_id,
+                .tree_id = c.tree_id,
+            }) catch unreachable;
+            w.blob(body) catch unreachable;
+            const message = out[hdr.transport_header_size..w.pos];
+            if (c.sign_key) |key| signing.sign(.hmac_sha256, key, message);
+            hdr.writeFrameLength(out[0..hdr.transport_header_size], @intCast(message.len));
+            return w.pos;
         }
 
         /// Sends a pre-built frame (for compound chains the helpers do not
@@ -222,7 +244,11 @@ pub fn LoopbackClient(comptime ServerType: type) type {
 
         pub fn readFile(c: *Self, offset: u64, length: u32) []const u8 {
             var body: [64]u8 = undefined;
-            var w = wire.Writer.init(&body);
+            return c.send(.read, c.readBody(offset, length, &body));
+        }
+
+        pub fn readBody(c: *Self, offset: u64, length: u32, out: []u8) []const u8 {
+            var w = wire.Writer.init(out);
             w.u16_(49) catch unreachable;
             w.u8_(0) catch unreachable; // Padding
             w.u8_(0) catch unreachable; // Flags
@@ -235,7 +261,7 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             w.u16_(0) catch unreachable;
             w.u16_(0) catch unreachable;
             w.u8_(0) catch unreachable;
-            return c.send(.read, w.written());
+            return w.written();
         }
 
         pub fn queryDirectory(c: *Self, class: info.FileClass, pattern: []const u8, flags: u8) []const u8 {

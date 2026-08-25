@@ -77,6 +77,16 @@ const Daemon = struct {
     accounts: Accounts,
 };
 
+/// The daemon itself, and not in `main`'s frame — the difference is not
+/// cosmetic. A frame this large is faulted in as it is set up, so on Linux the
+/// process would start with its entire ceiling resident: 39 MiB before a single
+/// client connects. Uninitialised static storage is demand-zero instead, so an
+/// idle daemon costs the couple of megabytes it is actually using and grows
+/// only as connections arrive and touch their buffers. Same value, same fixed
+/// size, same absence of an allocator — just pages the kernel hands over when
+/// they are asked for rather than all at once.
+var daemon: Daemon = undefined;
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var options: Options = .{};
     parseArgs(&options, init.args) catch |err| {
@@ -93,9 +103,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.err("no shares: pass at least one --share NAME=PATH", .{});
         return error.NoShares;
     }
-
-    // ~20 MiB; build.zig raises the stack to fit it.
-    var daemon: Daemon = undefined;
 
     try loadAccounts(&daemon.accounts, &options);
     daemon.smbd.init(.{
@@ -134,7 +141,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     defer daemon.smbd.deinit();
 
-    log.info("easysambad listening on {s}:{d} ({s} backend, {d} connections max, {d} MiB resident)", .{
+    // The number is the ceiling, not what the process is using: the tables are
+    // reserved up front but only paged in as connections arrive and touch them.
+    log.info("easysambad listening on {s}:{d} ({s} backend, {d} connections max, {d} MiB ceiling)", .{
         if (options.bind.len == 0) "*" else options.bind,
         options.port,
         @tagName(easysamba.poller.backend),

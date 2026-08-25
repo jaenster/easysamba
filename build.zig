@@ -24,6 +24,12 @@ pub fn build(b: *std.Build) void {
         "Concurrent connections (default 32)",
     ) orelse 32;
 
+    const strip = b.option(
+        bool,
+        "strip",
+        "Drop debug info from the binary (default: on for release builds)",
+    ) orelse (optimize != .Debug);
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "force_poll", force_poll);
     build_options.addOption(u32, "max_io_kib", max_io_kib);
@@ -44,15 +50,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = &.{
                 .{ .name = "easysamba", .module = easysamba },
                 .{ .name = "build_options", .module = options_module },
             },
         }),
     });
-    // Server, connection table and buffer pool are one value in main's frame.
-    // That does not fit the 8 MiB the OS hands us by default.
-    exe.stack_size = 256 * 1024 * 1024;
     b.installArtifact(exe);
 
     const bench = b.addExecutable(.{
@@ -64,7 +68,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "easysamba", .module = easysamba }},
         }),
     });
-    bench.stack_size = 64 * 1024 * 1024;
     const bench_run = b.addRunArtifact(bench);
     const bench_step = b.step("bench", "Measure the dispatch path (use -Doptimize=ReleaseFast)");
     bench_step.dependOn(&bench_run.step);

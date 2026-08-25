@@ -71,8 +71,8 @@ const Harness = struct {
         h.fs.init();
         h.server.init(config, h.accounts.authenticator());
         try h.server.addShare(h.fs.share("data"));
-        h.conn = &h.server.conns[0];
-        h.client = Client.init(h.server, h.conn, h.scratch);
+        h.client = Client.init(h.server, 0, h.scratch);
+        h.conn = h.client.conn;
         return h;
     }
 
@@ -621,6 +621,72 @@ test "a connection that never authenticates is dropped, an authenticated one is 
     live.conn.opened_at = 0;
     live.server.reapUnauthenticated(1_000_000);
     try testing.expect(live.conn.active);
+}
+
+test "the connection table's bookkeeping survives clients coming and going" {
+    // Four slots, so the accounting that decides which ones are free and how
+    // many have yet to authenticate has something to get wrong. Getting it
+    // wrong is not a subtle failure: an undercount stops the handshake reaper
+    // from ever running again, and an overcount takes the count below zero.
+    const Multi = Server(.{
+        .max_connections = 4,
+        .sessions_per_connection = 2,
+        .trees_per_session = 2,
+        .opens_per_session = 4,
+        .max_shares = 1,
+        .in_buffer = 16 * 1024,
+        .out_buffer = 16 * 1024,
+        .max_read = 4096,
+        .max_write = 4096,
+        .max_transact = 4096,
+        .path_bytes = 128,
+        .search_pattern_bytes = 32,
+    });
+    const MultiClient = loopback.LoopbackClient(Multi);
+
+    const server = try testing.allocator.create(Multi);
+    defer testing.allocator.destroy(server);
+    const fs = try testing.allocator.create(TestFs);
+    defer testing.allocator.destroy(fs);
+    const accounts = try testing.allocator.create(Accounts);
+    defer testing.allocator.destroy(accounts);
+    const scratch = try testing.allocator.alloc(u8, 16 * 1024);
+    defer testing.allocator.free(scratch);
+
+    try accounts.parse("alice:" ++ password);
+    fs.init();
+    server.init(.{ .handshake_timeout_ms = 1000 }, accounts.authenticator());
+    try server.addShare(fs.share("data"));
+    defer server.deinit();
+
+    var clients: [4]MultiClient = undefined;
+    for (&clients, 0..) |*client, i| {
+        client.* = MultiClient.init(server, i, scratch);
+        client.conn.opened_at = 0; // as if they all arrived at time zero
+        _ = client.negotiate();
+    }
+    // One of them gets as far as a session; the other three never will.
+    try testing.expectEqual(status.SUCCESS, clients[1].login("alice", password, .raw, false));
+
+    server.reapUnauthenticated(2000);
+    try testing.expect(!clients[0].conn.active);
+    try testing.expect(clients[1].conn.active);
+    try testing.expect(!clients[2].conn.active);
+    try testing.expect(!clients[3].conn.active);
+
+    // Reaping again must be a no-op rather than an underflow, and the freed
+    // slots must be usable by the next client to arrive.
+    server.reapUnauthenticated(9999);
+    clients[2] = MultiClient.init(server, 2, scratch);
+    clients[2].conn.opened_at = 9999;
+    _ = clients[2].negotiate();
+    try testing.expect(clients[2].conn.active);
+    try testing.expectEqual(status.SUCCESS, clients[2].login("alice", password, .raw, false));
+
+    // And the one that authenticated long ago is still not a candidate.
+    server.reapUnauthenticated(1_000_000);
+    try testing.expect(clients[1].conn.active);
+    try testing.expect(clients[2].conn.active);
 }
 
 test "restarting authentication reuses the session slot instead of burning another" {

@@ -99,8 +99,7 @@ fn run(backend: Backend) !void {
         },
     }
 
-    const conn = &world.server.conns[0];
-    var client = Client.init(&world.server, conn, &world.scratch);
+    var client = Client.init(&world.server, 0, &world.scratch);
     _ = client.negotiate();
     if (client.login("alice", password, .raw, false) != status.SUCCESS) return error.LoginFailed;
     if (client.treeConnect("data") != status.SUCCESS) return error.TreeConnectFailed;
@@ -117,6 +116,8 @@ fn run(backend: Backend) !void {
     try benchRead(&client, "large.bin", 64 * 1024);
     try benchRead(&client, "large.bin", 512 * 1024);
     try benchWrite(&client, 64 * 1024);
+    try benchPipelined(&client, .echo, 64);
+    try benchPipelined(&client, .read, 32);
     try benchSignedRead(64 * 1024);
 
     if (backend == .posixfs) world.posixfs.deinit();
@@ -254,10 +255,69 @@ fn benchWrite(client: *Client, length: u32) !void {
     timer.report(length);
 }
 
+/// Stands in for a socket that took everything offered.
+fn drain(client: *Client) void {
+    client.conn.out_len = 0;
+    client.conn.out_sent = 0;
+}
+
+/// Requests through the connection buffers instead of straight into the
+/// dispatcher. Transport framing, the input cursor, and the pause-and-resume of
+/// a full output buffer are all on this path and none of them are on
+/// `handleFrame`'s, so this is the part a pipelining client actually pays for.
+fn benchPipelined(client: *Client, comptime kind: enum { echo, read }, depth: usize) !void {
+    const length: u32 = 64 * 1024;
+    if (kind == .read) {
+        if (client.open(.{ .path = "large.bin" }) != status.SUCCESS) return error.OpenFailed;
+    }
+    defer if (kind == .read) {
+        _ = client.closeFile();
+    };
+
+    // One batch, built once: what is being measured is the server's side of a
+    // pipeline, not the cost of assembling one.
+    var batch: [256 * 1024]u8 = undefined;
+    var used: usize = 0;
+    var i: usize = 0;
+    while (i < depth) : (i += 1) {
+        var body: [64]u8 = undefined;
+        used += switch (kind) {
+            .echo => client.buildFrame(.echo, &.{ 4, 0, 0, 0 }, batch[used..]),
+            .read => client.buildFrame(.read, client.readBody(0, length, &body), batch[used..]),
+        };
+    }
+
+    var label: [64]u8 = undefined;
+    const name = switch (kind) {
+        .echo => std.fmt.bufPrint(&label, "echo, {d} pipelined", .{depth}),
+        .read => std.fmt.bufPrint(&label, "read 64 KiB, {d} pipelined", .{depth}),
+    } catch unreachable;
+
+    var timer = Timer.start(name);
+    while (timer.next()) {
+        drain(client);
+        var fed: usize = 0;
+        while (fed < used) {
+            const accepted = client.server.feed(client.conn, batch[fed..used]);
+            if (accepted == 0) return error.Stalled;
+            fed += accepted;
+            drain(client);
+        }
+        // Whatever a full output buffer left unanswered, answered now — the
+        // resume a writable socket would have caused.
+        while (client.conn.inPending() > 0) {
+            _ = client.server.feed(client.conn, &.{});
+            drain(client);
+        }
+    }
+    timer.scale(depth);
+    timer.report(if (kind == .read) length else 0);
+}
+
 /// The same read with HMAC-SHA256 over every request and response, which is
 /// what a Windows 11 client asks for by default.
 fn benchSignedRead(length: u32) !void {
-    var signed = Client.init(&world.server, &world.server.conns[0], &world.scratch);
+    var signed = Client.init(&world.server, 0, &world.scratch);
     _ = signed.negotiate();
     if (signed.login("alice", password, .raw, true) != status.SUCCESS) return error.LoginFailed;
     if (signed.treeConnect("data") != status.SUCCESS) return error.TreeConnectFailed;
@@ -307,6 +367,11 @@ const Timer = struct {
         if (nowNs() < t.deadline) return true;
         t.iterations -= 1;
         return false;
+    }
+
+    /// One iteration answered `factor` requests, not one.
+    fn scale(t: *Timer, factor: usize) void {
+        t.iterations = t.warmup + (t.iterations - t.warmup) * factor;
     }
 
     fn report(t: *Timer, bytes_per_op: u64) void {

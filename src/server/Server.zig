@@ -148,6 +148,13 @@ pub fn Server(comptime limits: Limits) type {
         id_counter: u64 = 0,
 
         conns: [limits.max_connections]Conn = undefined,
+        /// Which connection slots are free, and how many connections have not
+        /// authenticated yet. Both exist so the event loop never walks the
+        /// connection table: one `Conn` is most of a megabyte, so a scan of 32
+        /// of them touches tens of megabytes of cold memory — more work per
+        /// wakeup than answering the request that caused it.
+        free_slots: std.StaticBitSet(limits.max_connections) = undefined,
+        unauthenticated: usize = 0,
         poller: Poller = undefined,
         listen_fd: socket.Handle = socket.invalid,
 
@@ -236,6 +243,11 @@ pub fn Server(comptime limits: Limits) type {
             token: poller_mod.Token = 0,
 
             in: [limits.in_buffer]u8 = undefined,
+            /// Unread input is `in[in_start..in_len]`. Answering advances the
+            /// start; the tail is only shuffled down when the buffer has
+            /// actually reached its end, which for a client whose messages fit
+            /// is never.
+            in_start: usize = 0,
             in_len: usize = 0,
             out: [limits.out_buffer]u8 = undefined,
             out_len: usize = 0,
@@ -265,6 +277,49 @@ pub fn Server(comptime limits: Limits) type {
             fn outPending(c: *const Conn) usize {
                 return c.out_len - c.out_sent;
             }
+
+            pub fn inPending(c: *const Conn) usize {
+                return c.in_len - c.in_start;
+            }
+
+            /// Makes room at the end of the input buffer by dropping the part
+            /// already answered. Only worth doing when the buffer is actually
+            /// against its end, which for a client whose messages fit is never.
+            fn compactInput(c: *Conn) void {
+                if (c.in_start == 0) return;
+                if (c.in_start == c.in_len) {
+                    c.in_start = 0;
+                    c.in_len = 0;
+                    return;
+                }
+                std.mem.copyForwards(u8, c.in[0..], c.in[c.in_start..c.in_len]);
+                c.in_len -= c.in_start;
+                c.in_start = 0;
+            }
+
+            /// Puts a slot back to its starting state. Assigning a whole `Conn`
+            /// would be shorter, but it also rewrites the two I/O buffers and
+            /// every path and pattern field behind the handle tables — close to
+            /// a megabyte of stores, and a megabyte of pages made resident, for
+            /// a connection that may only ever ask for a directory listing.
+            /// Only the fields that mean something get touched.
+            fn reset(c: *Conn) void {
+                c.active = false;
+                c.fd = socket.invalid;
+                c.token = 0;
+                c.in_start = 0;
+                c.in_len = 0;
+                c.out_len = 0;
+                c.out_sent = 0;
+                c.interest = .{ .read = true };
+                c.opened_at = 0;
+                c.authenticated = false;
+                c.negotiated = false;
+                c.dialect = .smb_2_1;
+                c.client_signing_required = false;
+                c.closing = false;
+                for (&c.sessions) |*session| session.active = false;
+            }
         };
 
         // ------------------------------------------------------------- setup
@@ -277,10 +332,24 @@ pub fn Server(comptime limits: Limits) type {
             s.id_counter = 0;
             s.start_time = filetime.now();
             random.fill(&s.guid);
-            for (&s.conns) |*c| {
-                c.active = false;
-                c.fd = socket.invalid;
-            }
+            s.free_slots = .initFull();
+            s.unauthenticated = 0;
+            // The connection table is deliberately left alone. Writing even one
+            // byte per slot would make the whole pool resident — the slots are
+            // a megabyte apart and Linux backs an anonymous fault with a 2 MiB
+            // huge page — so an idle daemon would start out holding its entire
+            // ceiling. `free_slots` is the record of which slots exist; a slot
+            // is written for the first time when a client arrives to use it.
+        }
+
+        /// The slots a client occupies. Callers iterate this rather than
+        /// `conns` itself: reading one field from every slot would touch every
+        /// slot, which is precisely the memory an idle daemon avoids. It is a
+        /// copy, so closing a connection mid-walk cannot disturb the walk.
+        fn takenSlots(s: *const Self) std.StaticBitSet(limits.max_connections) {
+            var taken = s.free_slots;
+            taken.toggleAll();
+            return taken;
         }
 
         pub fn addShare(s: *Self, share: Share) !void {
@@ -316,7 +385,10 @@ pub fn Server(comptime limits: Limits) type {
         }
 
         pub fn deinit(s: *Self) void {
-            for (&s.conns) |*c| {
+            var taken = s.takenSlots();
+            var live = taken.iterator(.{});
+            while (live.next()) |index| {
+                const c = &s.conns[index];
                 if (c.active) s.closeConn(c);
             }
             if (s.listen_fd != socket.invalid) socket.close(s.listen_fd);
@@ -347,7 +419,7 @@ pub fn Server(comptime limits: Limits) type {
                         // answers waits forever — a deadlock that only appears
                         // once a client has enough credits to fill the output
                         // buffer in one go.
-                        if (c.active and c.in_len > 0) s.pump(c);
+                        if (c.active and c.inPending() > 0) s.pump(c);
                     }
                     if (c.active and event.readiness.read) s.onReadable(c);
                     if (c.active and event.readiness.hangup and c.outPending() == 0) s.closeConn(c);
@@ -358,13 +430,19 @@ pub fn Server(comptime limits: Limits) type {
         }
 
         fn nextTimeout(s: *Self) i32 {
-            if (s.config.handshake_timeout_ms <= 0) return -1;
+            if (s.config.handshake_timeout_ms <= 0 or s.unauthenticated == 0) return -1;
             const now = socket.monotonicMs();
             var soonest: ?i64 = null;
-            for (&s.conns) |*c| {
+            var pending = s.unauthenticated;
+            var taken = s.takenSlots();
+            var live = taken.iterator(.{});
+            while (live.next()) |index| {
+                const c = &s.conns[index];
                 if (!c.active or c.authenticated) continue;
                 const remaining = c.opened_at + s.config.handshake_timeout_ms - now;
                 if (soonest == null or remaining < soonest.?) soonest = remaining;
+                pending -= 1;
+                if (pending == 0) break;
             }
             const wait = soonest orelse return -1;
             return @intCast(@max(wait, 10));
@@ -372,8 +450,11 @@ pub fn Server(comptime limits: Limits) type {
 
         /// Drops connections that never got as far as authenticating.
         pub fn reapUnauthenticated(s: *Self, now: i64) void {
-            if (s.config.handshake_timeout_ms <= 0) return;
-            for (&s.conns) |*c| {
+            if (s.config.handshake_timeout_ms <= 0 or s.unauthenticated == 0) return;
+            var taken = s.takenSlots();
+            var live = taken.iterator(.{});
+            while (live.next()) |index| {
+                const c = &s.conns[index];
                 if (!c.active or c.authenticated) continue;
                 if (now - c.opened_at < s.config.handshake_timeout_ms) continue;
                 log.warn("connection {d}: no authentication within {d}ms, dropping", .{
@@ -385,24 +466,26 @@ pub fn Server(comptime limits: Limits) type {
 
         fn acceptAll(s: *Self) void {
             while (socket.accept(s.listen_fd)) |fd| {
-                const slot = for (&s.conns, 0..) |*c, i| {
-                    if (!c.active) break .{ c, i };
-                } else {
+                const index = s.free_slots.findFirstSet() orelse {
                     log.warn("connection table full ({d}); refusing a client", .{limits.max_connections});
                     socket.close(fd);
                     continue;
                 };
-                const c = slot[0];
-                c.* = .{};
+                const c = &s.conns[index];
+                c.reset();
                 c.active = true;
                 c.fd = fd;
-                c.token = @intCast(slot[1]);
+                c.token = @intCast(index);
                 c.opened_at = socket.monotonicMs();
                 c.interest = .{ .read = true };
+                s.free_slots.unset(index);
+                s.unauthenticated += 1;
                 socket.setNoDelay(fd);
                 s.poller.add(fd, c.token, c.interest) catch {
                     log.err("cannot register a connection with the poller", .{});
                     c.active = false;
+                    s.free_slots.set(index);
+                    s.unauthenticated -= 1;
                     socket.close(fd);
                     continue;
                 };
@@ -410,7 +493,34 @@ pub fn Server(comptime limits: Limits) type {
             }
         }
 
+        /// Claims a connection slot that has no socket behind it: the
+        /// in-process client is a connection in every respect except the file
+        /// descriptor, and going through the same door keeps the connection
+        /// table's bookkeeping true for it too.
+        pub fn adopt(s: *Self, index: usize) *Conn {
+            const c = &s.conns[index];
+            // Asking the slot itself whether it is in use would read a field
+            // that has never been written for a slot no client has occupied.
+            if (!s.free_slots.isSet(index)) s.closeConn(c);
+            c.reset();
+            c.active = true;
+            c.token = @intCast(index);
+            c.opened_at = socket.monotonicMs();
+            s.free_slots.unset(index);
+            s.unauthenticated += 1;
+            return c;
+        }
+
+        fn markAuthenticated(s: *Self, c: *Conn) void {
+            if (c.authenticated) return;
+            c.authenticated = true;
+            s.unauthenticated -= 1;
+        }
+
         fn closeConn(s: *Self, c: *Conn) void {
+            // Closing twice would hand the same slot back twice and take the
+            // unauthenticated count below zero.
+            if (!c.active) return;
             for (&c.sessions) |*session| {
                 if (session.active) s.endSession(session);
             }
@@ -422,6 +532,8 @@ pub fn Server(comptime limits: Limits) type {
             }
             c.active = false;
             c.fd = socket.invalid;
+            if (!c.authenticated) s.unauthenticated -= 1;
+            s.free_slots.set(c.token);
             log.debug("connection {d} closed", .{c.token});
         }
 
@@ -444,11 +556,14 @@ pub fn Server(comptime limits: Limits) type {
 
         fn onReadable(s: *Self, c: *Conn) void {
             while (true) {
+                // Nothing left to append to: reclaim whatever has been answered
+                // before deciding the client is at fault.
+                if (c.in_len == limits.in_buffer) c.compactInput();
                 if (c.in_len == limits.in_buffer) {
-                    // Full, and pump could not drain it. Either the client is
-                    // sending a message larger than we ever agreed to, or we
-                    // are simply out of room to answer — the second is
-                    // backpressure and resolves itself once output drains.
+                    // Still full, and pump could not drain it. Either the
+                    // client is sending a message larger than we ever agreed
+                    // to, or we are simply out of room to answer — the second
+                    // is backpressure and resolves itself once output drains.
                     if (c.out_len + response_reserve > limits.out_buffer) return;
                     log.warn("connection {d}: oversized message, dropping", .{c.token});
                     s.closeConn(c);
@@ -478,6 +593,7 @@ pub fn Server(comptime limits: Limits) type {
         /// bytes were accepted — fewer than offered means the input buffer is
         /// full. Passing nothing resumes a connection that backpressure paused.
         pub fn feed(s: *Self, c: *Conn, bytes: []const u8) usize {
+            if (bytes.len > limits.in_buffer - c.in_len) c.compactInput();
             const accepted = @min(bytes.len, limits.in_buffer - c.in_len);
             @memcpy(c.in[c.in_len..][0..accepted], bytes[0..accepted]);
             c.in_len += accepted;
@@ -507,7 +623,7 @@ pub fn Server(comptime limits: Limits) type {
         fn answerBuffered(s: *Self, c: *Conn) usize {
             var consumed: usize = 0;
             while (!c.closing) {
-                const rest = c.in[consumed..c.in_len];
+                const rest = c.in[c.in_start..c.in_len];
                 const length = hdr.frameLength(rest) catch {
                     log.warn("connection {d}: bad transport framing", .{c.token});
                     c.closing = true;
@@ -523,12 +639,13 @@ pub fn Server(comptime limits: Limits) type {
 
                 const message = rest[hdr.transport_header_size..][0..length];
                 s.handleFrame(c, message);
+                c.in_start += hdr.transport_header_size + length;
                 consumed += hdr.transport_header_size + length;
             }
 
-            if (consumed > 0) {
-                std.mem.copyForwards(u8, c.in[0..], c.in[consumed..c.in_len]);
-                c.in_len -= consumed;
+            if (c.in_start == c.in_len) {
+                c.in_start = 0;
+                c.in_len = 0;
             }
             return consumed;
         }
@@ -1043,7 +1160,7 @@ pub fn Server(comptime limits: Limits) type {
             session.session_key = verified.session_key;
             session.account = account;
             session.established = true;
-            ctx.conn.authenticated = true;
+            s.markAuthenticated(ctx.conn);
             const name_len = @min(auth.user.len, session.user.len);
             @memcpy(session.user[0..name_len], auth.user[0..name_len]);
             session.user_len = name_len;
