@@ -1,5 +1,7 @@
 # easysamba
 
+[![ci](https://github.com/jaenster/easysamba/actions/workflows/ci.yml/badge.svg)](https://github.com/jaenster/easysamba/actions/workflows/ci.yml)
+
 An SMB2 file server in Zig. One thread, one poll loop, no heap after startup,
 and an adapter interface so what gets exported does not have to be a filesystem.
 
@@ -311,3 +313,12 @@ back. Three of the bugs in this repo's history were only ever visible there: a
 missing transport header, a `FileAllInformation` record one byte shorter than
 the Linux client accepts, and a startup path that made 35 MiB resident before
 the first client connected.
+
+CI runs the same three: unit tests and the mount battery on Linux and macOS, and
+`zig build check` across x86_64/aarch64, glibc/musl, both poll backends and a
+non-default `Limits` — because Zig only analyzes code it can reach, so a build
+that merely succeeds for another target proves very little.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

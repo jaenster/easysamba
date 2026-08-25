@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install zig and the smb clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cifs-utils smbclient
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | tar -xJ
+          echo "$PWD/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - run: zig build test --summary all
+      - run: zig build -Doptimize=ReleaseSafe
+
+      # The kernel cifs client needs root to mount, so the whole script runs
+      # under sudo rather than sprinkling it inside.
+      - name: mount the share with the kernel cifs client
+        run: sudo -E env "PATH=$PATH" test/integration.sh
+
+      - name: round trip through smbclient
+        run: |
+          mkdir -p /tmp/smbshare && echo "smbclient sees this" > /tmp/smbshare/file.txt
+          zig-out/bin/easysambad --port 4446 --bind 127.0.0.1 \
+              --share files=/tmp/smbshare --user alice:hunter2 --log warn &
+          sleep 1
+          smbclient //127.0.0.1/files -U alice%hunter2 -p 4446 -m SMB2 \
+              -c 'ls; get file.txt /tmp/got.txt; put /etc/hostname up.txt; ls; rm up.txt'
+          grep -q "smbclient sees this" /tmp/got.txt
+          smbclient //127.0.0.1/files -U alice%wrongpass -p 4446 -m SMB2 -c 'ls' 2>&1 \
+              | grep -q NT_STATUS_LOGON_FAILURE
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install zig
+        run: |
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-macos-$ZIG_VERSION.tar.xz" | tar -xJ
+          echo "$PWD/zig-aarch64-macos-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - run: zig build test --summary all
+      - run: zig build -Doptimize=ReleaseSafe
+      - name: mount the share with mount_smbfs
+        run: test/integration.sh
+
+  # Zig only analyzes reachable code, so a plain cross build proves almost
+  # nothing about a platform. `zig build check` builds the test binary, which
+  # forces analysis of the whole tree — the only way to catch a broken epoll
+  # path from a macOS laptop, or a broken kqueue path from CI.
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64-linux,   args: -Dtarget=x86_64-linux }
+          - { name: aarch64-linux,  args: -Dtarget=aarch64-linux }
+          - { name: x86_64-musl,    args: -Dtarget=x86_64-linux-musl }
+          - { name: aarch64-macos,  args: -Dtarget=aarch64-macos }
+          - { name: x86_64-macos,   args: -Dtarget=x86_64-macos }
+          - { name: poll-backend,   args: -Dpoll }
+          - { name: big-limits,     args: "-Dconnections=256 -Dmax-io=1024" }
+    name: check ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install zig
+        run: |
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | tar -xJ
+          echo "$PWD/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - run: zig build check -Doptimize=ReleaseSafe ${{ matrix.args }}
