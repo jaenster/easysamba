@@ -33,9 +33,12 @@ pub const OBJECT_NAME_COLLISION: Status = 0xC000_0035;
 pub const OBJECT_PATH_NOT_FOUND: Status = 0xC000_003A;
 pub const OBJECT_PATH_SYNTAX_BAD: Status = 0xC000_003B;
 pub const SHARING_VIOLATION: Status = 0xC000_0043;
+pub const FILE_LOCK_CONFLICT: Status = 0xC000_0054;
+pub const LOCK_NOT_GRANTED: Status = 0xC000_0055;
 pub const DELETE_PENDING: Status = 0xC000_0056;
 pub const LOGON_FAILURE: Status = 0xC000_006D;
 pub const ACCOUNT_RESTRICTION: Status = 0xC000_006E;
+pub const RANGE_NOT_LOCKED: Status = 0xC000_007E;
 pub const DISK_FULL: Status = 0xC000_007F;
 pub const NO_MEMORY: Status = 0xC000_009A;
 pub const FILE_IS_A_DIRECTORY: Status = 0xC000_00BA;
@@ -78,6 +81,9 @@ pub fn name(s: Status) ?[]const u8 {
         DIRECTORY_NOT_EMPTY => "DIRECTORY_NOT_EMPTY",
         INVALID_HANDLE => "INVALID_HANDLE",
         DISK_FULL => "DISK_FULL",
+        FILE_LOCK_CONFLICT => "FILE_LOCK_CONFLICT",
+        LOCK_NOT_GRANTED => "LOCK_NOT_GRANTED",
+        RANGE_NOT_LOCKED => "RANGE_NOT_LOCKED",
         END_OF_FILE => "END_OF_FILE",
         else => null,
     };

@@ -85,10 +85,6 @@ const Harness = struct {
     }
 };
 
-
-
-
-
 fn setup(config: server_mod.Config, accounts: []const u8) !*Harness {
     const c = try Harness.create(testing.allocator, config, accounts);
     try c.fs.put("notes.txt", "hello smb");
@@ -908,4 +904,128 @@ test "cancel is the one request with no reply" {
     defer c.destroy(testing.allocator);
     const response = c.client.send(.cancel, &.{ 4, 0, 0, 0 });
     try testing.expectEqual(@as(usize, 0), response.len);
+}
+
+/// FILE_GENERIC_READ plus the write bits: what a client that intends to lock
+/// and then change a range asks for.
+const read_write: u32 = 0x0012_0089 | 0x0000_0116;
+
+const unlock = loopback.lock_flags.unlock;
+const shared = loopback.lock_flags.shared;
+
+/// Opens the same file twice and hands back both handles, which is the only
+/// interesting case for locking: a lock exists to be seen by someone else.
+fn twoHandles(c: *Harness) ![2][16]u8 {
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+    const first = c.client.file_id;
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+    return .{ first, c.client.file_id };
+}
+
+test "an exclusive lock keeps every other handle out of the range" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const handles = try twoHandles(c);
+    const holder, const other = handles;
+
+    c.client.file_id = holder;
+    try testing.expectEqual(status.SUCCESS, c.client.lock(&.{.{ .offset = 0, .length = 4 }}));
+
+    // Whoever holds the lock is not blocked by it; that is what it was for.
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.readFile(0, 4)));
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "held")));
+
+    c.client.file_id = other;
+    try testing.expectEqual(status.FILE_LOCK_CONFLICT, statusOf(c.client.readFile(0, 4)));
+    try testing.expectEqual(status.FILE_LOCK_CONFLICT, statusOf(c.client.writeFile(2, "xx")));
+    // The rest of the file is nobody's business but its own.
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(4, "yy")));
+
+    c.client.file_id = holder;
+    try testing.expectEqual(status.SUCCESS, c.client.lock(&.{.{ .offset = 0, .length = 4, .flags = unlock }}));
+    c.client.file_id = other;
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.readFile(0, 4)));
+}
+
+test "a shared lock lets other readers through and keeps writers out" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const handles = try twoHandles(c);
+    const holder, const other = handles;
+
+    c.client.file_id = holder;
+    try testing.expectEqual(status.SUCCESS, c.client.lock(&.{.{ .offset = 0, .length = 4, .flags = shared }}));
+
+    c.client.file_id = other;
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.readFile(0, 4)));
+    try testing.expectEqual(status.FILE_LOCK_CONFLICT, statusOf(c.client.writeFile(0, "no")));
+    // A second reader may share it; an exclusive claim may not.
+    try testing.expectEqual(status.SUCCESS, c.client.lock(&.{.{ .offset = 0, .length = 4, .flags = shared }}));
+    try testing.expectEqual(status.LOCK_NOT_GRANTED, c.client.lock(&.{.{ .offset = 2, .length = 4 }}));
+}
+
+test "a lock request that cannot be granted in full takes none of it" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const handles = try twoHandles(c);
+    const holder, const other = handles;
+
+    c.client.file_id = holder;
+    try testing.expectEqual(status.SUCCESS, c.client.lock(&.{.{ .offset = 0, .length = 4 }}));
+
+    // The second range collides; the first must not survive the refusal.
+    c.client.file_id = other;
+    try testing.expectEqual(status.LOCK_NOT_GRANTED, c.client.lock(&.{
+        .{ .offset = 8, .length = 4 },
+        .{ .offset = 0, .length = 4 },
+    }));
+
+    c.client.file_id = holder;
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(8, "z")));
+    try testing.expectEqual(@as(usize, 1), c.server.lock_count);
+}
+
+test "unlocking a range nobody holds is refused" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+
+    try testing.expectEqual(status.RANGE_NOT_LOCKED, c.client.lock(&.{.{ .offset = 0, .length = 4, .flags = unlock }}));
+    try testing.expectEqual(status.SUCCESS, c.client.lock(&.{.{ .offset = 0, .length = 4 }}));
+    // The range has to match the one that was taken, not merely overlap it.
+    try testing.expectEqual(status.RANGE_NOT_LOCKED, c.client.lock(&.{.{ .offset = 0, .length = 2, .flags = unlock }}));
+    try testing.expectEqual(status.SUCCESS, c.client.lock(&.{.{ .offset = 0, .length = 4, .flags = unlock }}));
+    try testing.expectEqual(@as(usize, 0), c.server.lock_count);
+}
+
+test "locks go when the handle that took them goes" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const handles = try twoHandles(c);
+    const holder, const other = handles;
+
+    c.client.file_id = holder;
+    try testing.expectEqual(status.SUCCESS, c.client.lock(&.{
+        .{ .offset = 0, .length = 4 },
+        .{ .offset = 16, .length = 4 },
+    }));
+    try testing.expectEqual(@as(usize, 2), c.server.lock_count);
+
+    _ = c.client.closeFile();
+    try testing.expectEqual(@as(usize, 0), c.server.lock_count);
+
+    c.client.file_id = other;
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "free")));
+}
+
+test "a lock on a directory, or on nothing at all, is refused" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "docs", .options = 0x0000_0001 }));
+    try testing.expectEqual(status.INVALID_DEVICE_REQUEST, c.client.lock(&.{.{ .offset = 0, .length = 4 }}));
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+    try testing.expectEqual(status.INVALID_PARAMETER, c.client.lock(&.{}));
+    // Neither shared nor exclusive nor unlock: nothing to do and no way to say so.
+    try testing.expectEqual(status.INVALID_PARAMETER, c.client.lock(&.{.{ .offset = 0, .length = 4, .flags = 0 }}));
 }

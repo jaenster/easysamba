@@ -6,10 +6,11 @@
 //! ceiling is knowable before it runs rather than discovered under load.
 //!
 //! What it speaks: SMB 2.0.2 and 2.1, NTLMv2 authentication (never guest,
-//! never anonymous), HMAC-SHA256 signing, and compounded requests. What it
+//! never anonymous), HMAC-SHA256 signing, compounded requests, and byte-range
+//! locks that are actually enforced against reads and writes. What it
 //! deliberately does not: oplocks and leases (never granted, so no client
-//! caches data we might invalidate), byte-range locks (accepted, not enforced),
-//! change notification, DFS, and SMB3 — the dialect list stops at 2.1 because
+//! caches data we might invalidate), change notification, DFS, and SMB3 —
+//! the dialect list stops at 2.1 because
 //! every 3.x feature a client would then expect (signing over CMAC, negotiate
 //! contexts, preauth integrity, encryption) is a correctness cliff, not an
 //! optimisation.
@@ -48,6 +49,10 @@ pub const Limits = struct {
     max_read: u32 = 64 * 1024,
     max_write: u32 = 64 * 1024,
     max_transact: u32 = 64 * 1024,
+    /// Byte-range locks held anywhere on the server at once. One shared table
+    /// rather than a slice of every connection's ceiling: locks are rare, and a
+    /// lock has to be visible to every handle on the file, not just its own.
+    max_locks: usize = 128,
     /// Longest path an open handle remembers.
     path_bytes: usize = 512,
     search_pattern_bytes: usize = 128,
@@ -155,6 +160,12 @@ pub fn Server(comptime limits: Limits) type {
         /// wakeup than answering the request that caused it.
         free_slots: std.StaticBitSet(limits.max_connections) = undefined,
         unauthenticated: usize = 0,
+        /// Byte-range locks, densely packed: `locks[0..lock_count]` are the
+        /// live ones and releasing one swaps the last into the hole. Dense
+        /// because every read and write walks it, and because a table nobody
+        /// has locked anything in should stay memory the process never touched.
+        locks: [limits.max_locks]Lock = undefined,
+        lock_count: usize = 0,
         poller: Poller = undefined,
         listen_fd: socket.Handle = socket.invalid,
 
@@ -183,6 +194,10 @@ pub fn Server(comptime limits: Limits) type {
             handle: Share.Handle = 0,
             path: [limits.path_bytes]u8 = undefined,
             path_len: usize = 0,
+            /// The path, hashed, so a lock can name the file it belongs to
+            /// without a copy of the path per lock. Two paths that collided
+            /// would lock each other out, never let each other through.
+            path_hash: u64 = 0,
             is_dir: bool = false,
             can_read: bool = false,
             can_write: bool = false,
@@ -205,6 +220,20 @@ pub fn Server(comptime limits: Limits) type {
             fn pattern_(o: *const Open) []const u8 {
                 return o.pattern[0..o.pattern_len];
             }
+        };
+
+        /// One granted byte-range lock. The file is named by its share and
+        /// the hash of its path rather than by the handle that took the lock,
+        /// because the whole point of a lock is that the *other* handles on
+        /// that file — including handles another session opened — see it.
+        pub const Lock = struct {
+            share: usize = 0,
+            path_hash: u64 = 0,
+            /// The `Open.id` that took it, and the only one that may drop it.
+            owner: u64 = 0,
+            offset: u64 = 0,
+            length: u64 = 0,
+            exclusive: bool = false,
         };
 
         pub const Session = struct {
@@ -334,6 +363,7 @@ pub fn Server(comptime limits: Limits) type {
             random.fill(&s.guid);
             s.free_slots = .initFull();
             s.unauthenticated = 0;
+            s.lock_count = 0;
             // The connection table is deliberately left alone. Writing even one
             // byte per slot would make the whole pool resident — the slots are
             // a megabyte apart and Linux backs an anonymous fault with a 2 MiB
@@ -955,7 +985,7 @@ pub fn Server(comptime limits: Limits) type {
                 .query_directory => s.handleQueryDirectory(ctx),
                 .query_info => s.handleQueryInfo(ctx),
                 .set_info => s.handleSetInfo(ctx),
-                .lock => writeLock(ctx),
+                .lock => s.handleLock(ctx),
                 // Not supported, and saying so plainly is the point: a client
                 // that is told "no" falls back, a client left waiting hangs.
                 .ioctl, .change_notify, .oplock_break => status.NOT_SUPPORTED,
@@ -1290,8 +1320,8 @@ pub fn Server(comptime limits: Limits) type {
             ctx.w.u32_(if (writable) access.full else access.read_only) catch return status.INSUFF_SERVER_RESOURCES;
 
             log.info("connection {d}: '{s}' connected to \\\\{s}\\{s}{s}", .{
-                ctx.conn.token,     session.user_(),
-                s.config.netbios_name, if (is_ipc) ipc_name else s.shares[share_index].name,
+                ctx.conn.token,                       session.user_(),
+                s.config.netbios_name,                if (is_ipc) ipc_name else s.shares[share_index].name,
                 if (writable) "" else " (read-only)",
             });
             return status.SUCCESS;
@@ -1371,6 +1401,7 @@ pub fn Server(comptime limits: Limits) type {
 
         fn closeOpen(s: *Self, session: *Session, open: *Open) void {
             _ = session;
+            s.releaseLocks(open.id);
             const share = s.shares[open.share];
             if (open.delete_on_close) {
                 share.remove(open.handle) catch |err| {
@@ -1461,6 +1492,7 @@ pub fn Server(comptime limits: Limits) type {
             open.delete_on_close = options & create_options.DELETE_ON_CLOSE != 0;
             @memcpy(open.path[0..path.len], path);
             open.path_len = path.len;
+            open.path_hash = std.hash.Wyhash.hash(0, path);
 
             ctx.chain.file_id = @splat(0);
             std.mem.writeInt(u64, ctx.chain.file_id[0..8], open.id, .little);
@@ -1548,6 +1580,7 @@ pub fn Server(comptime limits: Limits) type {
             if (open.is_dir) return status.INVALID_DEVICE_REQUEST;
             if (!open.can_read) return status.ACCESS_DENIED;
             if (length > limits.max_read) return status.INVALID_PARAMETER;
+            if (s.lockedAgainst(open, offset, length, false)) return status.FILE_LOCK_CONFLICT;
 
             ctx.w.u16_(17) catch return status.INSUFF_SERVER_RESOURCES;
             const data_offset_at = ctx.w.pos;
@@ -1588,6 +1621,7 @@ pub fn Server(comptime limits: Limits) type {
             if (open.is_dir) return status.INVALID_DEVICE_REQUEST;
             if (!open.can_write) return status.ACCESS_DENIED;
             if (length > limits.max_write) return status.INVALID_PARAMETER;
+            if (s.lockedAgainst(open, offset, length, true)) return status.FILE_LOCK_CONFLICT;
 
             const request = wire.Reader.init(ctx.msg);
             const data = request.sliceAt(data_offset, length) catch return status.INVALID_PARAMETER;
@@ -1868,16 +1902,203 @@ pub fn Server(comptime limits: Limits) type {
             return status.SUCCESS;
         }
 
-        /// Byte-range locks are acknowledged but not enforced: this server has
-        /// one client's view of a share at a time and no way to arbitrate
-        /// between a lock and a change made underneath it. Refusing locks
-        /// outright breaks clients that take one before every write, so the
-        /// honest-but-workable answer is to say yes and document that it means
-        /// nothing.
-        fn writeLock(ctx: *Ctx) u32 {
+        // ------------------------------------------------------ byte-range locks
+
+        const lock_flags = struct {
+            const SHARED: u32 = 0x0000_0001;
+            const EXCLUSIVE: u32 = 0x0000_0002;
+            const UNLOCK: u32 = 0x0000_0004;
+            const FAIL_IMMEDIATELY: u32 = 0x0000_0010;
+
+            const kind: u32 = SHARED | EXCLUSIVE | UNLOCK;
+        };
+
+        const lock_element_size = 24;
+
+        const LockElement = struct {
+            offset: u64,
+            length: u64,
+            flags: u32,
+        };
+
+        fn lockElement(elements: []const u8, index: usize) LockElement {
+            const at = elements[index * lock_element_size ..][0..lock_element_size];
+            return .{
+                .offset = std.mem.readInt(u64, at[0..8], .little),
+                .length = std.mem.readInt(u64, at[8..16], .little),
+                .flags = std.mem.readInt(u32, at[16..20], .little),
+            };
+        }
+
+        /// Whether two ranges touch. A client that means "the whole file" sends
+        /// a length of 0xFFFFFFFFFFFFFFFF, so the ends saturate rather than
+        /// wrap — wrapping would turn the largest possible lock into no lock.
+        fn rangesOverlap(a_offset: u64, a_length: u64, b_offset: u64, b_length: u64) bool {
+            return a_offset < b_offset +| b_length and b_offset < a_offset +| a_length;
+        }
+
+        fn handleLock(s: *Self, ctx: *Ctx) u32 {
+            var r = wire.Reader.init(ctx.body);
+            const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
+            if (structure_size != 48) return status.INVALID_PARAMETER;
+            const count = r.u16_() catch return status.INVALID_PARAMETER;
+            _ = r.u32_() catch return status.INVALID_PARAMETER; // LockSequence
+            const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
+            if (count == 0) return status.INVALID_PARAMETER;
+
+            const open = findOpen(ctx, raw_id) orelse return status.FILE_CLOSED;
+            if (open.is_dir) return status.INVALID_DEVICE_REQUEST;
+
+            const elements = r.take(@as(usize, count) * lock_element_size) catch
+                return status.INVALID_PARAMETER;
+
+            // One request either takes locks or drops them; MS-SMB2 does not
+            // allow a mixture, and the two halves have different failure modes.
+            const unlocking = lockElement(elements, 0).flags & lock_flags.UNLOCK != 0;
+            const code = if (unlocking)
+                s.unlockRanges(open, elements, count)
+            else
+                s.lockRanges(open, elements, count);
+            if (code != status.SUCCESS) return code;
+
             ctx.w.u16_(4) catch return status.INSUFF_SERVER_RESOURCES;
             ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES;
             return status.SUCCESS;
+        }
+
+        /// Takes every lock in the request or none of them. A client told its
+        /// request failed will not send an unlock for the parts that happened
+        /// to succeed, so a half-applied request is a lock nobody can release.
+        ///
+        /// Rolling back is a truncation because taking locks only ever appends.
+        fn lockRanges(s: *Self, open: *const Open, elements: []const u8, count: u16) u32 {
+            const before = s.lock_count;
+            for (0..count) |index| {
+                const element = lockElement(elements, index);
+                const exclusive = switch (element.flags & lock_flags.kind) {
+                    lock_flags.SHARED => false,
+                    lock_flags.EXCLUSIVE => true,
+                    else => {
+                        s.lock_count = before;
+                        return status.INVALID_PARAMETER;
+                    },
+                };
+                if (s.lock_count == limits.max_locks) {
+                    s.lock_count = before;
+                    return status.INSUFF_SERVER_RESOURCES;
+                }
+                if (s.lockConflict(open, element.offset, element.length, exclusive)) {
+                    s.lock_count = before;
+                    // A client that leaves FAIL_IMMEDIATELY off is asking to
+                    // wait for the holder to let go. There is nowhere to park a
+                    // half-answered request here, and a client left waiting for
+                    // an answer that never comes is worse off than one told no.
+                    return status.LOCK_NOT_GRANTED;
+                }
+                s.locks[s.lock_count] = .{
+                    .share = open.share,
+                    .path_hash = open.path_hash,
+                    .owner = open.id,
+                    .offset = element.offset,
+                    .length = element.length,
+                    .exclusive = exclusive,
+                };
+                s.lock_count += 1;
+            }
+            return status.SUCCESS;
+        }
+
+        /// Drops every range in the request, or leaves them all alone: the same
+        /// all-or-nothing rule, which is why nothing is removed until every
+        /// range has been matched to a lock this handle holds.
+        fn unlockRanges(s: *Self, open: *const Open, elements: []const u8, count: u16) u32 {
+            var claimed = std.StaticBitSet(limits.max_locks).initEmpty();
+            for (0..count) |index| {
+                const element = lockElement(elements, index);
+                if (element.flags & lock_flags.kind != lock_flags.UNLOCK) return status.INVALID_PARAMETER;
+                const held = s.findLock(open, element.offset, element.length, claimed) orelse
+                    return status.RANGE_NOT_LOCKED;
+                claimed.set(held);
+            }
+            s.dropLocks(claimed);
+            return status.SUCCESS;
+        }
+
+        /// The lock this handle holds over exactly this range, skipping the
+        /// ones an earlier range in the same request already spoke for — two
+        /// identical shared locks are two locks, and one unlock drops one.
+        fn findLock(
+            s: *const Self,
+            open: *const Open,
+            offset: u64,
+            length: u64,
+            claimed: std.StaticBitSet(limits.max_locks),
+        ) ?usize {
+            for (s.locks[0..s.lock_count], 0..) |lock, index| {
+                if (claimed.isSet(index)) continue;
+                if (lock.owner != open.id) continue;
+                if (lock.offset == offset and lock.length == length) return index;
+            }
+            return null;
+        }
+
+        /// Removes the marked locks by swapping the last one into each hole.
+        /// Backwards, so that everything above the hole has already gone and a
+        /// swap can never move a lock that is still waiting to be removed.
+        fn dropLocks(s: *Self, marked: std.StaticBitSet(limits.max_locks)) void {
+            var index = s.lock_count;
+            while (index > 0) {
+                index -= 1;
+                if (!marked.isSet(index)) continue;
+                s.lock_count -= 1;
+                s.locks[index] = s.locks[s.lock_count];
+            }
+        }
+
+        /// Everything a handle held goes when the handle does. A lock that
+        /// outlived its handle could never be released: the only key to it is a
+        /// FileId that has stopped existing.
+        fn releaseLocks(s: *Self, owner: u64) void {
+            if (s.lock_count == 0) return;
+            var index = s.lock_count;
+            while (index > 0) {
+                index -= 1;
+                if (s.locks[index].owner != owner) continue;
+                s.lock_count -= 1;
+                s.locks[index] = s.locks[s.lock_count];
+            }
+        }
+
+        /// Whether a new lock would collide with one already held. Two shared
+        /// locks never collide; anything else overlapping does, including a
+        /// second lock from the same handle, which is what Windows does and
+        /// what a client that tracks its own locks expects.
+        fn lockConflict(s: *const Self, open: *const Open, offset: u64, length: u64, exclusive: bool) bool {
+            for (s.locks[0..s.lock_count]) |lock| {
+                if (lock.share != open.share or lock.path_hash != open.path_hash) continue;
+                if (!exclusive and !lock.exclusive) continue;
+                if (rangesOverlap(offset, length, lock.offset, lock.length)) return true;
+            }
+            return false;
+        }
+
+        /// Whether some *other* handle's lock stands in the way of this I/O.
+        /// Reads are stopped only by an exclusive lock; writes by any lock. A
+        /// handle is never blocked by a lock it took itself — that is what
+        /// taking the lock was for.
+        ///
+        /// This runs on every read and every write, so it begins by asking
+        /// whether anything is locked at all: on a share nobody locks, which is
+        /// most of them, the cost is one load and one branch.
+        fn lockedAgainst(s: *const Self, open: *const Open, offset: u64, length: u64, writing: bool) bool {
+            if (s.lock_count == 0) return false;
+            for (s.locks[0..s.lock_count]) |lock| {
+                if (lock.owner == open.id) continue;
+                if (lock.share != open.share or lock.path_hash != open.path_hash) continue;
+                if (!writing and !lock.exclusive) continue;
+                if (rangesOverlap(offset, length, lock.offset, lock.length)) return true;
+            }
+            return false;
         }
     };
 }

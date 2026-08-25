@@ -247,7 +247,19 @@ says so), and compounded requests — which matters, because macOS opens, querie
 and closes a file in a single round trip.
 
 Implemented: negotiate, session setup, logoff, tree connect/disconnect, create,
-close, flush, read, write, query directory, query info, set info, echo, cancel.
+close, flush, read, write, lock, query directory, query info, set info, echo,
+cancel.
+
+Byte-range locks are real, not acknowledged and forgotten. A lock belongs to the
+handle that took it and is visible to every other handle on the file, including
+one another session opened; a read is stopped by an overlapping exclusive lock
+and a write by any overlapping lock, both with `STATUS_FILE_LOCK_CONFLICT`. A
+request that asks for several ranges gets all of them or none. Locks are dropped
+when the handle closes, which is also what happens when a client disappears
+mid-edit. The one deviation from MS-SMB2: a request that would have to wait is
+refused with `STATUS_LOCK_NOT_GRANTED` instead of being parked, because there is
+nowhere in a single-threaded server to park a half-answered request, and a
+client told "no" copes better than a client left waiting forever.
 
 Deliberately not implemented, and answered with a clear "no" rather than
 silence:
@@ -258,9 +270,6 @@ silence:
   uses 2.1.
 * **Oplocks and leases.** Never granted, so no client caches data this server
   might invalidate.
-* **Byte-range locks.** Accepted and not enforced. Refusing them outright breaks
-  clients that lock before every write; pretending is the workable answer, and
-  it means nothing.
 * **Change notification, DFS, named pipes.** `IPC$` connects and is empty, which
   is what a client needs to get on with mounting a real share. Browsing a server
   for its share list needs RPC over that pipe and does not work; mounting a share
@@ -290,11 +299,11 @@ silence:
 
 ```sh
 zig build                                # zig-out/bin/easysambad
-zig build test                           # 139 unit and protocol tests
+zig build test                           # 145 unit and protocol tests
 zig build check -Dtarget=x86_64-linux    # type-check another platform's backend
 zig build bench -Doptimize=ReleaseFast   # the numbers above
 test/integration.sh                      # mount it for real and use it
-test/docker-linux.sh                     # same, on Linux, both clients
+test/docker-linux.sh                     # same, on Linux, both clients, plus locks
 test/footprint.sh                        # memory and CPU while serving a GiB
 ```
 

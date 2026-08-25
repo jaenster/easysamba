@@ -325,8 +325,41 @@ pub fn LoopbackClient(comptime ServerType: type) type {
         pub fn echo(c: *Self) []const u8 {
             return c.send(.echo, &.{ 4, 0, 0, 0 });
         }
+
+        /// One LOCK request covering every range given, which is how a client
+        /// takes or drops several at once — and the only way to see whether the
+        /// server applies them all or none.
+        pub fn lock(c: *Self, ranges: []const LockRange) u32 {
+            var body: [512]u8 = undefined;
+            var w = wire.Writer.init(&body);
+            w.u16_(48) catch unreachable;
+            w.u16_(@intCast(ranges.len)) catch unreachable; // LockCount
+            w.u32_(0) catch unreachable; // LockSequence
+            w.blob(&c.file_id) catch unreachable;
+            for (ranges) |range| {
+                w.u64_(range.offset) catch unreachable;
+                w.u64_(range.length) catch unreachable;
+                w.u32_(range.flags) catch unreachable;
+                w.u32_(0) catch unreachable; // Reserved
+            }
+            return statusOf(c.send(.lock, w.written()));
+        }
     };
 }
+
+pub const LockRange = struct {
+    offset: u64,
+    length: u64,
+    flags: u32 = lock_flags.exclusive,
+};
+
+/// LockFlags from MS-SMB2.
+pub const lock_flags = struct {
+    pub const shared: u32 = 0x0000_0001;
+    pub const exclusive: u32 = 0x0000_0002;
+    pub const unlock: u32 = 0x0000_0004;
+    pub const fail_immediately: u32 = 0x0000_0010;
+};
 
 /// Strips the transport header the server puts in front of every frame, and
 /// checks it against what follows.

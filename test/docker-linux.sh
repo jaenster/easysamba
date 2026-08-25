@@ -21,7 +21,7 @@ zig build -Doptimize=ReleaseSafe -Dtarget="$target" --prefix zig-out/"$target"
 
 cat > /tmp/easysamba-docker-test.sh <<'INNER'
 set -eu
-apk add --no-cache cifs-utils samba-client >/dev/null 2>&1
+apk add --no-cache cifs-utils samba-client python3 >/dev/null 2>&1
 cd /work
 
 echo "=== kernel cifs client ==="
@@ -38,6 +38,20 @@ smbclient //127.0.0.1/files -U alice%hunter2 -p 4446 -m SMB2 -c 'ls; get file.tx
 grep -q "smbclient sees this" /tmp/got.txt && echo "  ok    smbclient round trip"
 smbclient //127.0.0.1/files -U alice%wrongpass -p 4446 -m SMB2 -c 'ls' 2>&1 \
     | grep -q NT_STATUS_LOGON_FAILURE && echo "  ok    smbclient wrong password refused"
+
+echo
+echo "=== byte-range locks ==="
+# The kernel cifs client sends these for real; macOS answers advisory locks
+# itself with ENOTSUP and never puts them on the wire, so this is the only
+# place a lock taken by an operating system reaches the server.
+mkdir -p /tmp/lockmnt && printf 'hello lock test\n' > /tmp/smbshare/locked.txt
+mount -t cifs //127.0.0.1/files /tmp/lockmnt \
+    -o "username=alice,password=hunter2,port=4446,vers=2.1,actimeo=0"
+result=$(python3 /work/test/lockcheck.py /tmp/lockmnt/locked.txt)
+[ "$result" = "conflict" ] \
+    && echo "  ok    a second process is refused the locked range" \
+    || echo "  FAIL  second process saw: $result"
+umount /tmp/lockmnt
 INNER
 
 docker run --rm --privileged --platform "$platform" \
