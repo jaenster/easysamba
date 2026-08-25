@@ -11,7 +11,9 @@
 //! leases for a 2.1 client, level-II oplocks for an older one — taken back with
 //! a break the moment somebody changes the file. Change notification is
 //! answered asynchronously, which is the one place a request outlives the frame
-//! that carried it. What it deliberately does not: write or handle caching
+//! that carried it, and a copy inside a share is done by the server rather than
+//! dragged through the client. What it deliberately does not: write or handle
+//! caching
 //! (both need a request parked half-answered while a client writes back or
 //! closes, and there is nowhere to park one), DFS, and SMB3 — the dialect list
 //! stops at 2.1 because
@@ -57,6 +59,9 @@ pub const Limits = struct {
     /// cannot have one is simply told so and asks the server every time, so
     /// this is a cache size, not a correctness limit.
     max_oplocks: usize = 64,
+    /// Scratch for a server-side copy. A copy of any size loops through it, so
+    /// this is how much moves per read and write, not how much can be copied.
+    copy_buffer: usize = 64 * 1024,
     /// Directories being watched for changes at once. A client watches one
     /// directory per window it has open, so this is roughly how many folders
     /// may be on screen across every client.
@@ -191,6 +196,13 @@ pub fn Server(comptime limits: Limits) type {
         /// "not yet", and the entry is what that promise is made of.
         watches: [limits.max_watches]Watch = undefined,
         watch_count: usize = 0,
+        /// Where a server-side copy passes through. One thread, one copy at a
+        /// time, so one buffer.
+        copy: [limits.copy_buffer]u8 = undefined,
+        /// Mixed into the key that names a handle to a copy. A key is quoted
+        /// back to the server by a client, so it must not be guessable from the
+        /// handle alone.
+        resume_salt: [8]u8 = @splat(0),
         poller: Poller = undefined,
         listen_fd: socket.Handle = socket.invalid,
 
@@ -459,6 +471,7 @@ pub fn Server(comptime limits: Limits) type {
             s.grant_count = 0;
             s.break_count = 0;
             s.watch_count = 0;
+            random.fill(&s.resume_salt);
             // The connection table is deliberately left alone. Writing even one
             // byte per slot would make the whole pool resident — the slots are
             // a megabyte apart and Linux backs an anonymous fault with a 2 MiB
@@ -1196,7 +1209,7 @@ pub fn Server(comptime limits: Limits) type {
                 // Not supported, and saying so plainly is the point: a client
                 // that is told "no" falls back, a client left waiting hangs.
                 .change_notify => s.handleChangeNotify(ctx),
-                .ioctl => status.NOT_SUPPORTED,
+                .ioctl => s.handleIoctl(ctx),
                 else => status.NOT_IMPLEMENTED,
             };
         }
@@ -2381,6 +2394,168 @@ pub fn Server(comptime limits: Limits) type {
                 },
                 else => return status.INVALID_PARAMETER,
             }
+            return status.SUCCESS;
+        }
+
+        // ------------------------------------------------------ server-side copy
+
+        const fsctl = struct {
+            const request_resume_key: u32 = 0x0014_0078;
+            const copychunk: u32 = 0x0014_40F2;
+            const copychunk_write: u32 = 0x0014_80F2;
+        };
+
+        /// What one server-side copy may ask for. These are the numbers Windows
+        /// uses, so a client sized for a Windows server never exceeds them.
+        const copychunk_limits = struct {
+            const chunks: u32 = 16;
+            const chunk_bytes: u64 = 1024 * 1024;
+            const total_bytes: u64 = 16 * 1024 * 1024;
+        };
+
+        const resume_key_size = 24;
+        const copychunk_header = 32;
+        const copychunk_element = 24;
+
+        /// Control codes, of which this server implements the two that matter:
+        /// the pair that lets a client copy a file without the bytes leaving
+        /// the machine. Everything else is refused rather than half-answered.
+        fn handleIoctl(s: *Self, ctx: *Ctx) u32 {
+            var r = wire.Reader.init(ctx.body);
+            const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
+            if (structure_size != 57) return status.INVALID_PARAMETER;
+            _ = r.u16_() catch return status.INVALID_PARAMETER; // Reserved
+            const code = r.u32_() catch return status.INVALID_PARAMETER;
+            const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
+            const input_offset = r.u32_() catch return status.INVALID_PARAMETER;
+            const input_count = r.u32_() catch return status.INVALID_PARAMETER;
+
+            switch (code) {
+                fsctl.request_resume_key, fsctl.copychunk, fsctl.copychunk_write => {},
+                // Said plainly, because a client that is told no falls back to
+                // reading and writing the bytes itself, which always works.
+                else => return status.NOT_SUPPORTED,
+            }
+
+            const open = findOpen(ctx, raw_id) orelse return status.FILE_CLOSED;
+
+            ctx.w.u16_(49) catch return status.INSUFF_SERVER_RESOURCES; // StructureSize
+            ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved
+            ctx.w.u32_(code) catch return status.INSUFF_SERVER_RESOURCES;
+            writeFileId(ctx.w, open.id) catch return status.INSUFF_SERVER_RESOURCES;
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // InputOffset
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // InputCount
+            const output_at = ctx.w.pos;
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // OutputOffset, patched below
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // OutputCount, patched below
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Flags
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved2
+
+            const buffer_at = ctx.rel();
+            const result = switch (code) {
+                fsctl.request_resume_key => s.writeResumeKey(ctx, open),
+                else => s.copyChunks(ctx, open, input_offset, input_count),
+            };
+            if (result != status.SUCCESS) return result;
+
+            ctx.w.patchInt(u32, output_at, buffer_at) catch {};
+            ctx.w.patchInt(u32, output_at + 4, ctx.rel() - buffer_at) catch {};
+            return status.SUCCESS;
+        }
+
+        /// Names an open handle so a later copy can quote it as the source. The
+        /// name is the handle plus a secret this server made at startup, so it
+        /// cannot be worked out from a FileId a client has seen.
+        fn writeResumeKey(s: *Self, ctx: *Ctx, open: *const Open) u32 {
+            var key: [resume_key_size]u8 = @splat(0);
+            std.mem.writeInt(u64, key[0..8], open.id, .little);
+            @memcpy(key[8..16], &s.resume_salt);
+            ctx.w.blob(&key) catch return status.INSUFF_SERVER_RESOURCES;
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // ContextLength
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Context
+            return status.SUCCESS;
+        }
+
+        /// The handle a resume key names, if it is one this session opened.
+        /// Another session's handle is not reachable this way: a copy is a read
+        /// and a write, and both have to be things this client may do.
+        fn openForResumeKey(s: *const Self, session: *Session, key: []const u8) ?*Open {
+            if (key.len < resume_key_size) return null;
+            if (!std.mem.eql(u8, key[8..16], &s.resume_salt)) return null;
+            const id = std.mem.readInt(u64, key[0..8], .little);
+            const index = id & slot_mask;
+            if (index >= session.opens.len) return null;
+            const open = &session.opens[@intCast(index)];
+            if (!open.active or open.id != id) return null;
+            return open;
+        }
+
+        /// Copies ranges from one open file to another without the bytes ever
+        /// leaving this machine. macOS asks for this on every copy inside a
+        /// share; refusing it means the client reads a gigabyte over the
+        /// network and writes it straight back.
+        fn copyChunks(s: *Self, ctx: *Ctx, target: *Open, input_offset: u32, input_count: u32) u32 {
+            const request = wire.Reader.init(ctx.msg);
+            const input = request.sliceAt(input_offset, input_count) catch return status.INVALID_PARAMETER;
+            if (input.len < copychunk_header) return status.INVALID_PARAMETER;
+
+            const session = ctx.session.?;
+            const source = openForResumeKey(s, session, input[0..resume_key_size]) orelse
+                return status.OBJECT_NAME_NOT_FOUND;
+
+            const count = std.mem.readInt(u32, input[24..28], .little);
+            if (count == 0 or count > copychunk_limits.chunks) return status.INVALID_PARAMETER;
+            if (input.len < copychunk_header + count * copychunk_element) return status.INVALID_PARAMETER;
+
+            if (session.account.read_only) return status.ACCESS_DENIED;
+            if (target.is_dir or source.is_dir) return status.INVALID_DEVICE_REQUEST;
+            if (!target.can_write) return status.ACCESS_DENIED;
+            if (!source.can_read) return status.ACCESS_DENIED;
+
+            var total: u64 = 0;
+            for (0..count) |index| {
+                const at = input[copychunk_header + index * copychunk_element ..];
+                const chunk = .{
+                    .source = std.mem.readInt(u64, at[0..8], .little),
+                    .target = std.mem.readInt(u64, at[8..16], .little),
+                    .length = std.mem.readInt(u32, at[16..20], .little),
+                };
+                if (chunk.length > copychunk_limits.chunk_bytes) return status.INVALID_PARAMETER;
+                total += chunk.length;
+                if (total > copychunk_limits.total_bytes) return status.INVALID_PARAMETER;
+                if (s.lockedAgainst(source, chunk.source, chunk.length, false)) return status.FILE_LOCK_CONFLICT;
+                if (s.lockedAgainst(target, chunk.target, chunk.length, true)) return status.FILE_LOCK_CONFLICT;
+            }
+
+            const from = s.shares[source.share];
+            const to = s.shares[target.share];
+            var moved: u64 = 0;
+            for (0..count) |index| {
+                const at = input[copychunk_header + index * copychunk_element ..];
+                const source_offset = std.mem.readInt(u64, at[0..8], .little);
+                const target_offset = std.mem.readInt(u64, at[8..16], .little);
+                const length = std.mem.readInt(u32, at[16..20], .little);
+
+                var done: u64 = 0;
+                while (done < length) {
+                    const piece = @min(length - done, limits.copy_buffer);
+                    const got = from.read(source.handle, source_offset + done, s.copy[0..piece]) catch |err|
+                        return Share.statusFor(err);
+                    if (got == 0) break; // the source ended sooner than the client thought
+                    const put = to.write(target.handle, target_offset + done, s.copy[0..got]) catch |err|
+                        return Share.statusFor(err);
+                    done += put;
+                    if (put < got) break;
+                }
+                moved += done;
+            }
+
+            s.breakGrants(target);
+            s.noteOpenChange(target, notify_action.modified, notify_filter.last_write | notify_filter.size);
+
+            ctx.w.u32_(@intCast(count)) catch return status.INSUFF_SERVER_RESOURCES; // ChunksWritten
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // ChunkBytesWritten
+            ctx.w.u32_(@intCast(moved)) catch return status.INSUFF_SERVER_RESOURCES; // TotalBytesWritten
             return status.SUCCESS;
         }
 

@@ -593,8 +593,13 @@ test "unsupported commands are answered, not ignored" {
     const c = try loggedIn("alice");
     defer c.destroy(testing.allocator);
     var body: [64]u8 = @splat(0);
-    std.mem.writeInt(u16, body[0..2], 32, .little);
+    // A well-formed IOCTL asking for DFS referrals, which this server does not
+    // do and says so rather than leaving the client to guess.
+    std.mem.writeInt(u16, body[0..2], 57, .little);
+    std.mem.writeInt(u32, body[4..8], 0x0006_0194, .little);
     try testing.expectEqual(status.NOT_SUPPORTED, statusOf(c.client.send(.ioctl, body[0..56])));
+
+    std.mem.writeInt(u16, body[0..2], 32, .little);
     // Watching is supported; watching a handle that does not exist is not.
     try testing.expectEqual(status.FILE_CLOSED, statusOf(c.client.send(.change_notify, body[0..32])));
 }
@@ -1383,4 +1388,101 @@ test "a connection that goes takes its waiting requests with it" {
 
     c.server.closeConn(c.conn);
     try testing.expectEqual(@as(usize, 0), c.server.watch_count);
+}
+
+test "a server-side copy moves the bytes without them crossing the wire" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    // The source, and the name the server gives the handle to it.
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt" }));
+    const key_response = c.client.resumeKey();
+    try testing.expectEqual(status.SUCCESS, statusOf(key_response));
+    const output = loopback.ioctlOutput(key_response);
+    try testing.expectEqual(@as(usize, 32), output.len);
+    try testing.expect(!std.mem.allEqual(u8, output[0..24], 0));
+    // The response lives in the connection's output buffer, which the next
+    // request writes over, so the key has to be taken out of it first.
+    var key: [24]u8 = undefined;
+    @memcpy(&key, output[0..24]);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "copy.txt",
+        .access_mask = read_write,
+        .disposition = 2, // FILE_CREATE
+    }));
+    const response = c.client.copyChunks(&key, &.{
+        .{ .source = 0, .target = 0, .length = 9 },
+    });
+    try testing.expectEqual(status.SUCCESS, statusOf(response));
+
+    const result = loopback.ioctlOutput(response);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, result[0..4], .little)); // ChunksWritten
+    try testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, result[8..12], .little)); // TotalBytesWritten
+
+    // And the copy is the original, byte for byte.
+    const read = c.client.readFile(0, 32);
+    try testing.expectEqual(status.SUCCESS, statusOf(read));
+    const length = std.mem.readInt(u32, bodyOf(read)[4..8], .little);
+    try testing.expectEqualStrings("hello smb", read[64 + 16 ..][0..length]);
+}
+
+test "a copy quoting a key this server never issued is refused" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt" }));
+    var forged: [24]u8 = undefined;
+    @memcpy(&forged, loopback.ioctlOutput(c.client.resumeKey())[0..24]);
+    forged[8] ^= 0xFF; // the half the client cannot know
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "copy.txt",
+        .access_mask = read_write,
+        .disposition = 2,
+    }));
+    try testing.expectEqual(status.OBJECT_NAME_NOT_FOUND, statusOf(c.client.copyChunks(&forged, &.{
+        .{ .source = 0, .target = 0, .length = 9 },
+    })));
+}
+
+test "a copy larger than this server will do in one request is refused" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt" }));
+    var key: [24]u8 = undefined;
+    @memcpy(&key, loopback.ioctlOutput(c.client.resumeKey())[0..24]);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "copy.txt",
+        .access_mask = read_write,
+        .disposition = 2,
+    }));
+
+    // One chunk bigger than the largest this server accepts.
+    try testing.expectEqual(status.INVALID_PARAMETER, statusOf(c.client.copyChunks(&key, &.{
+        .{ .source = 0, .target = 0, .length = 2 * 1024 * 1024 },
+    })));
+    // Nothing was written, so the file is still the empty one it was created as.
+    try testing.expectEqual(status.END_OF_FILE, statusOf(c.client.readFile(0, 16)));
+}
+
+test "a copy tells the watchers and breaks the leases a write would" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt" }));
+    var key: [24]u8 = undefined;
+    @memcpy(&key, loopback.ioctlOutput(c.client.resumeKey())[0..24]);
+
+    _ = try watchDirectory(c, "", notify_write, false);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "copy.txt",
+        .access_mask = read_write,
+        .disposition = 2,
+    }));
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.copyChunks(&key, &.{
+        .{ .source = 0, .target = 0, .length = 9 },
+    })));
+
+    const message = notifyFrame(c) orelse return error.NoNotification;
+    var name_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("copy.txt", notifiedName(message, &name_buf));
 }

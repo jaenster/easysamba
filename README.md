@@ -248,7 +248,15 @@ and closes a file in a single round trip.
 
 Implemented: negotiate, session setup, logoff, tree connect/disconnect, create,
 close, flush, read, write, lock, query directory, query info, set info, echo,
-cancel, change notify, oplock break.
+cancel, change notify, oplock break, and the two control codes that make a
+server-side copy.
+
+A copy inside a share does not leave the machine. A client asks for a key
+naming the file it wants to copy from and then asks the server to move the
+ranges itself, so four megabytes copied between two files on the same share cost
+three small requests and no read or write on the wire at all. Windows and
+`smbclient` both use it; macOS asks for the key and then copies by hand anyway,
+which is its choice to make.
 
 Change notification is answered the way the protocol means it: a request the
 server cannot answer yet is acknowledged with `STATUS_PENDING`, an async id, and
@@ -295,7 +303,11 @@ silence:
   it back, and giving it the right to keep a handle open means the next opener
   waits for it to close — both are requests parked half-answered, which this
   server has nowhere to put.
-* **DFS and named pipes.** `IPC$` connects and is empty, which
+* **Every other control code.** DFS referrals, network interface queries,
+  pipe transceive and the rest are refused plainly. A client told no falls back
+  to doing the work itself, which always works; a client told a half-truth does
+  not.
+* **Named pipes.** `IPC$` connects and is empty, which
   is what a client needs to get on with mounting a real share. Browsing a server
   for its share list needs RPC over that pipe and does not work; mounting a share
   by name does.
@@ -324,11 +336,11 @@ silence:
 
 ```sh
 zig build                                # zig-out/bin/easysambad
-zig build test                           # 162 unit and protocol tests
+zig build test                           # 166 unit and protocol tests
 zig build check -Dtarget=x86_64-linux    # type-check another platform's backend
 zig build bench -Doptimize=ReleaseFast   # the numbers above
 test/integration.sh                      # mount it for real and use it
-test/docker-linux.sh                     # Linux: both clients, locks, leases, notify
+test/docker-linux.sh                     # Linux: locks, leases, notify, server copy
 test/footprint.sh                        # memory and CPU while serving a GiB
 ```
 

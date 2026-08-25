@@ -107,6 +107,20 @@ kill $watcher 2>/dev/null || true
 grep -q "0001 watched.txt" /tmp/notify.out \
     && echo "  ok    a watching client was told about the new file" \
     || echo "  FAIL  the watcher saw: $(cat /tmp/notify.out)"
+
+echo
+echo "=== server-side copy ==="
+head -c 4000000 /dev/urandom > /tmp/smbshare/big.bin
+moved_before=$(grep -c 'read ->' /tmp/lease.log || true)
+smbclient //127.0.0.1/files -U alice%hunter2 -p 4447 -m SMB2 \
+    -c 'scopy big.bin server-copy.bin' >/dev/null 2>&1
+cmp /tmp/smbshare/big.bin /tmp/smbshare/server-copy.bin \
+    && echo "  ok    the copy is identical" \
+    || echo "  FAIL  the copy differs"
+moved_after=$(grep -c 'read ->' /tmp/lease.log || true)
+[ "$moved_before" = "$moved_after" ] \
+    && echo "  ok    four megabytes copied without crossing the wire" \
+    || echo "  FAIL  the server read the file out to the client anyway"
 INNER
 
 docker run --rm --privileged --platform "$platform" \

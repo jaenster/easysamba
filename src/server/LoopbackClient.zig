@@ -122,6 +122,48 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             return message;
         }
 
+        /// Asks the server to name the open handle, so a later copy can quote
+        /// it as the source.
+        pub fn resumeKey(c: *Self) []const u8 {
+            return c.ioctl(0x0014_0078, &.{});
+        }
+
+        /// Asks the server to copy ranges from the handle a resume key names
+        /// into the handle this client has open.
+        pub fn copyChunks(c: *Self, key: []const u8, chunks: []const Chunk) []const u8 {
+            var input: [256]u8 = undefined;
+            var w = wire.Writer.init(&input);
+            w.blob(key) catch unreachable; // SourceKey
+            w.u32_(@intCast(chunks.len)) catch unreachable;
+            w.u32_(0) catch unreachable; // Reserved
+            for (chunks) |chunk| {
+                w.u64_(chunk.source) catch unreachable;
+                w.u64_(chunk.target) catch unreachable;
+                w.u32_(chunk.length) catch unreachable;
+                w.u32_(0) catch unreachable; // Reserved
+            }
+            return c.ioctl(0x0014_40F2, w.written());
+        }
+
+        pub fn ioctl(c: *Self, code: u32, input: []const u8) []const u8 {
+            var body: [512]u8 = undefined;
+            var w = wire.Writer.init(&body);
+            w.u16_(57) catch unreachable;
+            w.u16_(0) catch unreachable; // Reserved
+            w.u32_(code) catch unreachable;
+            w.blob(&c.file_id) catch unreachable;
+            w.u32_(64 + 56) catch unreachable; // InputOffset
+            w.u32_(@intCast(input.len)) catch unreachable;
+            w.u32_(0) catch unreachable; // MaxInputResponse
+            w.u32_(0) catch unreachable; // OutputOffset
+            w.u32_(0) catch unreachable; // OutputCount
+            w.u32_(4096) catch unreachable; // MaxOutputResponse
+            w.u32_(1) catch unreachable; // Flags: SMB2_0_IOCTL_IS_FSCTL
+            w.u32_(0) catch unreachable; // Reserved2
+            w.blob(input) catch unreachable;
+            return c.send(.ioctl, w.written());
+        }
+
         /// Asks to hear about the next change to the directory this client has
         /// open. The answer to this is only ever "not yet".
         pub fn changeNotify(c: *Self, filter: u32, output_length: u32, watch_tree: bool) []const u8 {
@@ -430,6 +472,21 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             return statusOf(c.send(.lock, w.written()));
         }
     };
+}
+
+/// One range of a server-side copy.
+pub const Chunk = struct {
+    source: u64,
+    target: u64,
+    length: u32,
+};
+
+/// The part of an IOCTL response the server was asked to produce.
+pub fn ioctlOutput(response: []const u8) []const u8 {
+    const body = response[hdr.header_size..];
+    const offset = std.mem.readInt(u32, body[32..36], .little);
+    const length = std.mem.readInt(u32, body[36..40], .little);
+    return response[offset..][0..length];
 }
 
 pub const LockRange = struct {
