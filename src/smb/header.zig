@@ -84,6 +84,11 @@ pub const Header = struct {
     next_command: u32 = 0,
     message_id: u64 = 0,
     tree_id: u32 = 0,
+    /// Carried in the same eight bytes as the tree id, and read and written
+    /// instead of it when the message is asynchronous: a server that cannot
+    /// answer at once names its half-answer, and the client cancels by that
+    /// name.
+    async_id: u64 = 0,
     session_id: u64 = 0,
     signature: [16]u8 = @splat(0),
 
@@ -115,10 +120,14 @@ pub fn parse(bytes: []const u8) Error!Header {
     h.flags = try r.u32_();
     h.next_command = try r.u32_();
     h.message_id = try r.u64_();
-    // Bytes 32..40 are Reserved+TreeId in a sync header and AsyncId in an async
-    // one. A request is never async, so this is always Reserved then TreeId.
-    try r.skip(4);
-    h.tree_id = try r.u32_();
+    // Bytes 32..40 are Reserved+TreeId in a sync header and AsyncId in an
+    // async one. A request is asynchronous only when it cancels one.
+    if (h.flags & flags.ASYNC_COMMAND != 0) {
+        h.async_id = try r.u64_();
+    } else {
+        try r.skip(4);
+        h.tree_id = try r.u32_();
+    }
     h.session_id = try r.u64_();
     h.signature = (try r.takeArray(16)).*;
     return h;
@@ -134,8 +143,12 @@ pub fn write(w: *wire.Writer, h: Header) wire.Error!void {
     try w.u32_(h.flags);
     try w.u32_(h.next_command);
     try w.u64_(h.message_id);
-    try w.u32_(0); // Reserved
-    try w.u32_(h.tree_id);
+    if (h.flags & flags.ASYNC_COMMAND != 0) {
+        try w.u64_(h.async_id);
+    } else {
+        try w.u32_(0); // Reserved
+        try w.u32_(h.tree_id);
+    }
     try w.u64_(h.session_id);
     try w.blob(&h.signature);
 }

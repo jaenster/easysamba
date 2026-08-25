@@ -248,7 +248,18 @@ and closes a file in a single round trip.
 
 Implemented: negotiate, session setup, logoff, tree connect/disconnect, create,
 close, flush, read, write, lock, query directory, query info, set info, echo,
-cancel, oplock break.
+cancel, change notify, oplock break.
+
+Change notification is answered the way the protocol means it: a request the
+server cannot answer yet is acknowledged with `STATUS_PENDING`, an async id, and
+nothing else, and the answer arrives later in a frame of its own. Closing the
+directory ends the wait with `STATUS_NOTIFY_CLEANUP` and a `CANCEL` ends it with
+`STATUS_CANCELLED`, so a client is never left waiting for something that will
+not come. What it sees is every change made **through this server** — created,
+written, truncated, renamed and deleted files. A change made directly on the
+disk underneath is invisible: the share adapter deliberately exposes no
+filesystem to watch, which is what lets a share be an archive or a database view
+instead of a directory.
 
 Clients cache. A 2.1 client is offered a lease and an older one a level-II
 oplock, both granting the right to keep reading what it has already read — and
@@ -284,7 +295,7 @@ silence:
   it back, and giving it the right to keep a handle open means the next opener
   waits for it to close — both are requests parked half-answered, which this
   server has nowhere to put.
-* **Change notification, DFS, named pipes.** `IPC$` connects and is empty, which
+* **DFS and named pipes.** `IPC$` connects and is empty, which
   is what a client needs to get on with mounting a real share. Browsing a server
   for its share list needs RPC over that pipe and does not work; mounting a share
   by name does.
@@ -313,11 +324,11 @@ silence:
 
 ```sh
 zig build                                # zig-out/bin/easysambad
-zig build test                           # 153 unit and protocol tests
+zig build test                           # 162 unit and protocol tests
 zig build check -Dtarget=x86_64-linux    # type-check another platform's backend
 zig build bench -Doptimize=ReleaseFast   # the numbers above
 test/integration.sh                      # mount it for real and use it
-test/docker-linux.sh                     # same, on Linux: both clients, locks, leases
+test/docker-linux.sh                     # Linux: both clients, locks, leases, notify
 test/footprint.sh                        # memory and CPU while serving a GiB
 ```
 

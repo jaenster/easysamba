@@ -595,7 +595,8 @@ test "unsupported commands are answered, not ignored" {
     var body: [64]u8 = @splat(0);
     std.mem.writeInt(u16, body[0..2], 32, .little);
     try testing.expectEqual(status.NOT_SUPPORTED, statusOf(c.client.send(.ioctl, body[0..56])));
-    try testing.expectEqual(status.NOT_SUPPORTED, statusOf(c.client.send(.change_notify, body[0..32])));
+    // Watching is supported; watching a handle that does not exist is not.
+    try testing.expectEqual(status.FILE_CLOSED, statusOf(c.client.send(.change_notify, body[0..32])));
 }
 
 test "a connection that never authenticates is dropped, an authenticated one is not" {
@@ -1207,4 +1208,179 @@ test "a break on a signed session is signed" {
     var copy: [256]u8 = undefined;
     @memcpy(copy[0..notification.len], notification);
     try testing.expect(signing.verify(.hmac_sha256, c.client.sign_key.?, copy[0..notification.len]));
+}
+
+const notify_names: u32 = 0x0000_0001 | 0x0000_0002; // FILE_NAME | DIR_NAME
+const notify_write: u32 = 0x0000_0010; // LAST_WRITE
+
+/// Opens a directory and asks to hear about the next change to it. Returns the
+/// async id the server named the waiting request by.
+fn watchDirectory(c: *Harness, path: []const u8, filter: u32, watch_tree: bool) !u64 {
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = path, .options = 0x0000_0001 }));
+    const interim = c.client.changeNotify(filter, 4096, watch_tree);
+    try testing.expectEqual(status.PENDING, statusOf(interim));
+
+    const head = try hdr.parse(interim);
+    try testing.expect(head.flags & hdr.flags.ASYNC_COMMAND != 0);
+    try testing.expect(head.async_id != 0);
+    return head.async_id;
+}
+
+/// The change notification, if the last request produced one.
+fn notifyFrame(c: *Harness) ?[]const u8 {
+    const message = c.client.findFrame(.change_notify) orelse return null;
+    const head = hdr.parse(message) catch return null;
+    if (head.flags & hdr.flags.ASYNC_COMMAND == 0) return null;
+    return message;
+}
+
+fn notifiedName(message: []const u8, buffer: []u8) []const u8 {
+    const body = bodyOf(message);
+    const length = std.mem.readInt(u32, body[4..8], .little);
+    const record = body[8..][0..length];
+    const name_bytes = std.mem.readInt(u32, record[8..12], .little);
+    return unicode.toUtf8(buffer, record[12..][0..name_bytes]) catch unreachable;
+}
+
+test "a change notification waits, and answers when something changes" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    _ = try watchDirectory(c, "docs", notify_names, false);
+
+    // Someone creates a file in the watched directory.
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "docs/fresh.txt",
+        .access_mask = read_write,
+        .disposition = 2, // FILE_CREATE
+    }));
+
+    const message = notifyFrame(c) orelse return error.NoNotification;
+    try testing.expectEqual(status.SUCCESS, statusOf(message));
+    const body = bodyOf(message);
+    try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, body[0..2], .little));
+    const record = body[8..];
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, record[4..8], .little)); // FILE_ACTION_ADDED
+    var name_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("fresh.txt", notifiedName(message, &name_buf));
+
+    // The wait is over; the client has to ask again to hear the next one.
+    try testing.expectEqual(@as(usize, 0), c.server.watch_count);
+}
+
+test "a watch answers with the same message id and async id it was given" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const async_id = try watchDirectory(c, "docs", notify_names, false);
+    const asked = c.client.message_id;
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "docs/fresh.txt",
+        .access_mask = read_write,
+        .disposition = 2,
+    }));
+
+    const message = notifyFrame(c) orelse return error.NoNotification;
+    const head = try hdr.parse(message);
+    try testing.expectEqual(asked, head.message_id);
+    try testing.expectEqual(async_id, head.async_id);
+}
+
+test "a change deeper in the tree is reported only to a client watching the tree" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try c.fs.mkdir("docs/inner");
+
+    _ = try watchDirectory(c, "docs", notify_names, false);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "docs/inner/deep.txt",
+        .access_mask = read_write,
+        .disposition = 2,
+    }));
+    try testing.expect(notifyFrame(c) == null);
+    try testing.expectEqual(@as(usize, 1), c.server.watch_count);
+
+    // The same change, to a client that asked about the whole tree.
+    _ = try watchDirectory(c, "docs", notify_names, true);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "docs/inner/deeper.txt",
+        .access_mask = read_write,
+        .disposition = 2,
+    }));
+    const message = notifyFrame(c) orelse return error.NoNotification;
+    var name_buf: [64]u8 = undefined;
+    // Reported the way a client spells a path, not the way the adapter does.
+    try testing.expectEqualStrings("inner\\deeper.txt", notifiedName(message, &name_buf));
+}
+
+test "writing to a file is reported to whoever watches the directory" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const watched = c.client.file_id;
+    _ = try watchDirectory(c, "docs", notify_write, false);
+    _ = watched;
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "docs/report.pdf",
+        .access_mask = read_write,
+    }));
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "changed")));
+
+    const message = notifyFrame(c) orelse return error.NoNotification;
+    const body = bodyOf(message);
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, body[12..16], .little)); // MODIFIED
+}
+
+test "cancelling a watch answers the request it cancels" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const async_id = try watchDirectory(c, "docs", notify_names, false);
+
+    c.client.cancel(async_id);
+    const message = notifyFrame(c) orelse return error.NoNotification;
+    try testing.expectEqual(status.CANCELLED, statusOf(message));
+    try testing.expectEqual(@as(usize, 0), c.server.watch_count);
+}
+
+test "closing the directory ends the wait rather than leaving it hanging" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    _ = try watchDirectory(c, "docs", notify_names, false);
+
+    _ = c.client.closeFile();
+    const message = notifyFrame(c) orelse return error.NoNotification;
+    try testing.expectEqual(status.NOTIFY_CLEANUP, statusOf(message));
+    try testing.expectEqual(@as(usize, 0), c.server.watch_count);
+}
+
+test "a client that left no room to describe the change is told to look again" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "docs", .options = 0x0000_0001 }));
+    try testing.expectEqual(status.PENDING, statusOf(c.client.changeNotify(notify_names, 4, false)));
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "docs/fresh.txt",
+        .access_mask = read_write,
+        .disposition = 2,
+    }));
+    const message = notifyFrame(c) orelse return error.NoNotification;
+    try testing.expectEqual(status.NOTIFY_ENUM_DIR, statusOf(message));
+}
+
+test "only a directory can be watched" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt" }));
+    try testing.expectEqual(status.INVALID_PARAMETER, statusOf(c.client.changeNotify(notify_names, 4096, false)));
+    try testing.expectEqual(@as(usize, 0), c.server.watch_count);
+}
+
+test "a connection that goes takes its waiting requests with it" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    _ = try watchDirectory(c, "docs", notify_names, false);
+    try testing.expectEqual(@as(usize, 1), c.server.watch_count);
+
+    c.server.closeConn(c.conn);
+    try testing.expectEqual(@as(usize, 0), c.server.watch_count);
 }

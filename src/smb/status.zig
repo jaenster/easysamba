@@ -9,6 +9,7 @@ pub const Status = u32;
 
 pub const SUCCESS: Status = 0x0000_0000;
 pub const PENDING: Status = 0x0000_0103;
+pub const NOTIFY_CLEANUP: Status = 0x0000_010B;
 pub const NOTIFY_ENUM_DIR: Status = 0x0000_010C;
 pub const BUFFER_OVERFLOW: Status = 0x8000_0005;
 pub const NO_MORE_FILES: Status = 0x8000_0006;

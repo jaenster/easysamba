@@ -97,20 +97,64 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             return firstFrame(c.conn.out[0..c.conn.out_len]);
         }
 
-        /// The break the server sent of its own accord while answering the last
-        /// request, if it sent one. It arrives behind the response, in its own
-        /// transport frame, answering a request that was never made.
-        pub fn breakNotification(c: *Self) ?[]const u8 {
+        /// The first frame the server wrote for this command while answering
+        /// the last request — including frames no request asked for, which
+        /// arrive behind the response in transport frames of their own.
+        pub fn findFrame(c: *Self, command: hdr.Command) ?[]const u8 {
             const buffer = c.conn.out[0..c.conn.out_len];
             var at: usize = 0;
             while (at + hdr.transport_header_size <= buffer.len) {
                 const length = (hdr.frameLength(buffer[at..]) catch return null) orelse return null;
+                if (at + hdr.transport_header_size + length > buffer.len) return null;
                 const message = buffer[at + hdr.transport_header_size ..][0..length];
                 const head = hdr.parse(message) catch return null;
-                if (head.command == .oplock_break and head.message_id == std.math.maxInt(u64)) return message;
+                if (head.command == command) return message;
                 at += hdr.transport_header_size + length;
             }
             return null;
+        }
+
+        /// The break the server sent of its own accord, if it sent one.
+        pub fn breakNotification(c: *Self) ?[]const u8 {
+            const message = c.findFrame(.oplock_break) orelse return null;
+            const head = hdr.parse(message) catch return null;
+            if (head.message_id != std.math.maxInt(u64)) return null;
+            return message;
+        }
+
+        /// Asks to hear about the next change to the directory this client has
+        /// open. The answer to this is only ever "not yet".
+        pub fn changeNotify(c: *Self, filter: u32, output_length: u32, watch_tree: bool) []const u8 {
+            var body: [64]u8 = undefined;
+            var w = wire.Writer.init(&body);
+            w.u16_(32) catch unreachable;
+            w.u16_(if (watch_tree) 1 else 0) catch unreachable; // Flags: WATCH_TREE
+            w.u32_(output_length) catch unreachable;
+            w.blob(&c.file_id) catch unreachable;
+            w.u32_(filter) catch unreachable;
+            w.u32_(0) catch unreachable; // Reserved
+            return c.send(.change_notify, w.written());
+        }
+
+        /// Takes back a request the server has not answered, by the name the
+        /// server gave it. A cancel is never answered itself.
+        pub fn cancel(c: *Self, async_id: u64) void {
+            var w = wire.Writer.init(c.scratch);
+            c.message_id += 1;
+            hdr.write(&w, .{
+                .command = .cancel,
+                .credits = 1,
+                .flags = hdr.flags.ASYNC_COMMAND,
+                .message_id = c.message_id,
+                .async_id = async_id,
+                .session_id = c.session_id,
+            }) catch unreachable;
+            w.u16_(4) catch unreachable; // StructureSize
+            w.u16_(0) catch unreachable; // Reserved
+            const message = w.written();
+            if (c.sign_key) |key| signing.sign(.hmac_sha256, key, message);
+            c.conn.out_len = 0;
+            c.server.handleFrame(c.conn, message);
         }
 
         pub fn negotiate(c: *Self) []const u8 {

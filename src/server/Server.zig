@@ -9,10 +9,12 @@
 //! never anonymous), HMAC-SHA256 signing, compounded requests, byte-range locks
 //! that are actually enforced against reads and writes, and read caching —
 //! leases for a 2.1 client, level-II oplocks for an older one — taken back with
-//! a break the moment somebody changes the file. What it deliberately does not:
-//! write or handle caching (both need a request parked half-answered while a
-//! client writes back or closes, and there is nowhere to park one), change
-//! notification, DFS, and SMB3 — the dialect list stops at 2.1 because
+//! a break the moment somebody changes the file. Change notification is
+//! answered asynchronously, which is the one place a request outlives the frame
+//! that carried it. What it deliberately does not: write or handle caching
+//! (both need a request parked half-answered while a client writes back or
+//! closes, and there is nowhere to park one), DFS, and SMB3 — the dialect list
+//! stops at 2.1 because
 //! every 3.x feature a client would then expect (signing over CMAC, negotiate
 //! contexts, preauth integrity, encryption) is a correctness cliff, not an
 //! optimisation.
@@ -55,6 +57,10 @@ pub const Limits = struct {
     /// cannot have one is simply told so and asks the server every time, so
     /// this is a cache size, not a correctness limit.
     max_oplocks: usize = 64,
+    /// Directories being watched for changes at once. A client watches one
+    /// directory per window it has open, so this is roughly how many folders
+    /// may be on screen across every client.
+    max_watches: usize = 32,
     /// Byte-range locks held anywhere on the server at once. One shared table
     /// rather than a slice of every connection's ceiling: locks are rare, and a
     /// lock has to be visible to every handle on the file, not just its own.
@@ -180,6 +186,11 @@ pub fn Server(comptime limits: Limits) type {
         grant_count: usize = 0,
         breaks: [limits.max_oplocks]PendingBreak = undefined,
         break_count: usize = 0,
+        /// Change notifications a client is waiting on. A watch exists only
+        /// while its request is outstanding: the client asks, the server says
+        /// "not yet", and the entry is what that promise is made of.
+        watches: [limits.max_watches]Watch = undefined,
+        watch_count: usize = 0,
         poller: Poller = undefined,
         listen_fd: socket.Handle = socket.invalid,
 
@@ -281,6 +292,40 @@ pub fn Server(comptime limits: Limits) type {
             file_id: u64 = 0,
             lease_key: [16]u8 = @splat(0),
             is_lease: bool = false,
+        };
+
+        /// A CHANGE_NOTIFY that has been accepted and not yet answered.
+        pub const Watch = struct {
+            conn: poller_mod.Token = 0,
+            session_id: u64 = 0,
+            /// The request this is the other half of.
+            message_id: u64 = 0,
+            async_id: u64 = 0,
+            /// The directory handle it was asked on. Closing that handle ends
+            /// the wait, which is how a client stops watching.
+            owner: u64 = 0,
+            share: usize = 0,
+            /// The watched directory itself, not a hash of it: telling whether
+            /// a change happened inside it means comparing the paths.
+            path: [limits.path_bytes]u8 = undefined,
+            path_len: usize = 0,
+            watch_tree: bool = false,
+            filter: u32 = 0,
+            output_limit: u32 = 0,
+
+            /// What it is waiting to say, once there is something to say.
+            fired: bool = false,
+            fired_status: u32 = 0,
+            action: u32 = 0,
+            name: [limits.path_bytes]u8 = undefined,
+            name_len: usize = 0,
+
+            fn path_(w: *const Watch) []const u8 {
+                return w.path[0..w.path_len];
+            }
+            fn name_(w: *const Watch) []const u8 {
+                return w.name[0..w.name_len];
+            }
         };
 
         pub const Session = struct {
@@ -413,6 +458,7 @@ pub fn Server(comptime limits: Limits) type {
             s.lock_count = 0;
             s.grant_count = 0;
             s.break_count = 0;
+            s.watch_count = 0;
             // The connection table is deliberately left alone. Writing even one
             // byte per slot would make the whole pool resident — the slots are
             // a megabyte apart and Linux backs an anonymous fault with a 2 MiB
@@ -596,7 +642,9 @@ pub fn Server(comptime limits: Limits) type {
             s.unauthenticated -= 1;
         }
 
-        fn closeConn(s: *Self, c: *Conn) void {
+        /// Tears a connection down and hands its slot back. Public because a
+        /// server embedded in another program has to be able to drop a client.
+        pub fn closeConn(s: *Self, c: *Conn) void {
             // Closing twice would hand the same slot back twice and take the
             // unauthenticated count below zero.
             if (!c.active) return;
@@ -611,6 +659,9 @@ pub fn Server(comptime limits: Limits) type {
             }
             c.active = false;
             c.fd = socket.invalid;
+            // Nothing is owed to a connection that has gone, including the
+            // answers its own teardown just decided on.
+            s.dropWatches(c.token);
             if (!c.authenticated) s.unauthenticated -= 1;
             s.free_slots.set(c.token);
             log.debug("connection {d} closed", .{c.token});
@@ -774,6 +825,7 @@ pub fn Server(comptime limits: Limits) type {
         pub fn handleFrame(s: *Self, c: *Conn, message: []const u8) void {
             s.answerFrame(c, message);
             s.deliverBreaks();
+            s.deliverNotifications();
         }
 
         fn answerFrame(s: *Self, c: *Conn, message: []const u8) void {
@@ -933,6 +985,9 @@ pub fn Server(comptime limits: Limits) type {
             chain: *Chain,
             w: *wire.Writer,
             start: usize,
+            /// Set by a handler that cannot answer yet, and stamped into the
+            /// half-answer so the client can cancel it by name.
+            async_id: u64 = 0,
 
             /// Offset of the write cursor within this response message, which
             /// is what every SMB2 offset field is measured against.
@@ -953,8 +1008,12 @@ pub fn Server(comptime limits: Limits) type {
                 return;
             }
 
-            // CANCEL is the one request with no reply at all.
-            if (head.command == .cancel) return;
+            // CANCEL is the one request with no reply at all. What it cancels
+            // is answered instead, and separately.
+            if (head.command == .cancel) {
+                s.cancelWatch(c, head);
+                return;
+            }
 
             var response_head: hdr.Header = .{
                 .credit_charge = head.credit_charge,
@@ -1005,11 +1064,18 @@ pub fn Server(comptime limits: Limits) type {
                 };
                 // Anything chained onto a failed request fails with it — the
                 // handle or tree it was going to use never came into being.
-                chain.failed = code;
+                // A half-answer is not a failure: the request is still alive.
+                if (code != status.PENDING) chain.failed = code;
             } else if (!isInformational(code)) {
                 chain.failed = status.SUCCESS;
             }
             w.patchInt(u32, start + 8, code) catch {};
+            if (code == status.PENDING) {
+                // Not an answer yet. The flag is what tells the client so, and
+                // the id is the name it cancels the request by.
+                w.patchInt(u32, start + 16, hdr.flags.SERVER_TO_REDIR | hdr.flags.ASYNC_COMMAND) catch {};
+                w.patchInt(u64, start + 32, ctx.async_id) catch {};
+            }
 
             // Pad the message so the next one in the chain starts 8-aligned.
             const aligned = std.mem.alignForward(usize, w.pos - start, 8);
@@ -1129,7 +1195,8 @@ pub fn Server(comptime limits: Limits) type {
                 .lock => s.handleLock(ctx),
                 // Not supported, and saying so plainly is the point: a client
                 // that is told "no" falls back, a client left waiting hangs.
-                .ioctl, .change_notify => status.NOT_SUPPORTED,
+                .change_notify => s.handleChangeNotify(ctx),
+                .ioctl => status.NOT_SUPPORTED,
                 else => status.NOT_IMPLEMENTED,
             };
         }
@@ -1549,9 +1616,15 @@ pub fn Server(comptime limits: Limits) type {
             _ = session;
             s.releaseLocks(open.id);
             s.releaseGrant(open.id);
+            s.endWatches(open.id);
             const share = s.shares[open.share];
             if (open.delete_on_close) {
                 s.breakGrants(open);
+                s.noteOpenChange(
+                    open,
+                    notify_action.removed,
+                    if (open.is_dir) notify_filter.dir_name else notify_filter.file_name,
+                );
                 share.remove(open.handle) catch |err| {
                     log.warn("delete-on-close failed for '{s}': {s}", .{ open.path_(), @errorName(err) });
                 };
@@ -1652,7 +1725,15 @@ pub fn Server(comptime limits: Limits) type {
             );
             // Opening a file in a way that throws its contents away is a change
             // to it, so whoever was caching those contents has to hear about it.
-            if (disp == .supersede or disp == .overwrite or disp == .overwrite_if) s.breakGrants(open);
+            if (opened.action == .superseded or opened.action == .overwritten) {
+                s.breakGrants(open);
+                s.noteOpenChange(open, notify_action.modified, notify_filter.size | notify_filter.last_write);
+            }
+            if (opened.action == .created) s.noteOpenChange(
+                open,
+                notify_action.added,
+                if (open.is_dir) notify_filter.dir_name else notify_filter.file_name,
+            );
 
             ctx.chain.file_id = @splat(0);
             std.mem.writeInt(u64, ctx.chain.file_id[0..8], open.id, .little);
@@ -1813,6 +1894,7 @@ pub fn Server(comptime limits: Limits) type {
             const data = request.sliceAt(data_offset, length) catch return status.INVALID_PARAMETER;
             const wrote = s.shares[open.share].write(open.handle, offset, data) catch |err| return Share.statusFor(err);
             s.breakGrants(open);
+            s.noteOpenChange(open, notify_action.modified, notify_filter.last_write | notify_filter.size);
 
             ctx.w.u16_(17) catch return status.INSUFF_SERVER_RESOURCES;
             ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved
@@ -2052,6 +2134,7 @@ pub fn Server(comptime limits: Limits) type {
                 .basic => {
                     const changes = info.parseBasic(buffer) catch return status.INFO_LENGTH_MISMATCH;
                     share.setMeta(open.handle, changes) catch |err| return Share.statusFor(err);
+                    s.noteOpenChange(open, notify_action.modified, notify_filter.attributes | notify_filter.last_write);
                 },
                 .disposition => {
                     const delete = info.parseDisposition(buffer) catch return status.INFO_LENGTH_MISMATCH;
@@ -2063,6 +2146,7 @@ pub fn Server(comptime limits: Limits) type {
                     const size = info.parseEndOfFile(buffer) catch return status.INFO_LENGTH_MISMATCH;
                     share.truncate(open.handle, size) catch |err| return Share.statusFor(err);
                     s.breakGrants(open);
+                    s.noteOpenChange(open, notify_action.modified, notify_filter.size);
                 },
                 .rename => {
                     const rename = info.parseRename(buffer) catch return status.INFO_LENGTH_MISMATCH;
@@ -2076,10 +2160,13 @@ pub fn Server(comptime limits: Limits) type {
                     // now caching a file that is not there, and whoever was
                     // caching the new one is caching what this just replaced.
                     s.breakGrants(open);
+                    const named = if (open.is_dir) notify_filter.dir_name else notify_filter.file_name;
+                    s.noteOpenChange(open, notify_action.renamed_old, named);
                     @memcpy(open.path[0..path.len], path);
                     open.path_len = path.len;
                     s.renameOpen(open, std.hash.Wyhash.hash(0, path));
                     s.breakGrants(open);
+                    s.noteOpenChange(open, notify_action.renamed_new, named);
                 },
                 else => return status.INVALID_INFO_CLASS,
             }
@@ -2295,6 +2382,237 @@ pub fn Server(comptime limits: Limits) type {
                 else => return status.INVALID_PARAMETER,
             }
             return status.SUCCESS;
+        }
+
+        // ------------------------------------------------------ change notify
+
+        /// What a client asks to hear about.
+        const notify_filter = struct {
+            const file_name: u32 = 0x0000_0001;
+            const dir_name: u32 = 0x0000_0002;
+            const attributes: u32 = 0x0000_0004;
+            const size: u32 = 0x0000_0008;
+            const last_write: u32 = 0x0000_0010;
+        };
+
+        /// What happened, in the words MS-FSCC uses for it.
+        const notify_action = struct {
+            const added: u32 = 0x0000_0001;
+            const removed: u32 = 0x0000_0002;
+            const modified: u32 = 0x0000_0003;
+            const renamed_old: u32 = 0x0000_0004;
+            const renamed_new: u32 = 0x0000_0005;
+        };
+
+        /// Accepts a request that cannot be answered yet.
+        ///
+        /// The answer is a change nobody has made, so the client is told the
+        /// request is alive and given a name for it. What comes back later is
+        /// the same message id and the same name, carrying the change — or a
+        /// reason there will never be one, if the handle closes or the client
+        /// changes its mind.
+        fn handleChangeNotify(s: *Self, ctx: *Ctx) u32 {
+            var r = wire.Reader.init(ctx.body);
+            const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
+            if (structure_size != 32) return status.INVALID_PARAMETER;
+            const flags = r.u16_() catch return status.INVALID_PARAMETER;
+            const output_length = r.u32_() catch return status.INVALID_PARAMETER;
+            const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
+            const filter = r.u32_() catch return status.INVALID_PARAMETER;
+
+            const open = findOpen(ctx, raw_id) orelse return status.FILE_CLOSED;
+            // Watching anything but a directory is not a thing a client can ask
+            // for, and a file handle here means the client is confused.
+            if (!open.is_dir) return status.INVALID_PARAMETER;
+            if (filter == 0) return status.INVALID_PARAMETER;
+            if (s.watch_count == limits.max_watches) return status.INSUFF_SERVER_RESOURCES;
+
+            const watch = &s.watches[s.watch_count];
+            watch.* = .{
+                .conn = ctx.conn.token,
+                .session_id = ctx.session.?.id,
+                .message_id = ctx.head.message_id,
+                .async_id = s.nextId(),
+                .owner = open.id,
+                .share = open.share,
+                .path_len = open.path_len,
+                .watch_tree = flags & 0x0001 != 0,
+                .filter = filter,
+                .output_limit = output_length,
+            };
+            @memcpy(watch.path[0..open.path_len], open.path_());
+            s.watch_count += 1;
+
+            ctx.async_id = watch.async_id;
+            return status.PENDING;
+        }
+
+        /// The name a change has inside a watched directory, or nothing if it
+        /// did not happen there. The share root is the empty path, so
+        /// everything is somewhere inside it.
+        fn relativeTo(dir: []const u8, path: []const u8, watch_tree: bool) ?[]const u8 {
+            var rest = path;
+            if (dir.len != 0) {
+                if (path.len <= dir.len + 1) return null;
+                if (!std.mem.startsWith(u8, path, dir)) return null;
+                if (path[dir.len] != '/') return null;
+                rest = path[dir.len + 1 ..];
+            }
+            // Without WATCH_TREE the client asked about this directory, not
+            // about the directories inside it.
+            if (!watch_tree and std.mem.indexOfScalar(u8, rest, '/') != null) return null;
+            return rest;
+        }
+
+        /// Records what a waiting client is about to be told. The first change
+        /// wins: the answer carries one, and the client asks again immediately
+        /// after reading it.
+        fn arm(watch: *Watch, code: u32, action: u32, name: []const u8) void {
+            if (watch.fired) return;
+            watch.fired = true;
+            watch.fired_status = code;
+            watch.action = action;
+            const length = @min(name.len, watch.name.len);
+            @memcpy(watch.name[0..length], name[0..length]);
+            watch.name_len = length;
+        }
+
+        /// Something happened to a path; whoever asked to hear about it does.
+        ///
+        /// Only changes made through this server are seen. A file changed
+        /// directly on the disk underneath it is invisible, because the share
+        /// adapter deliberately hands out no filesystem to watch — the price of
+        /// a share being allowed to be something other than a directory.
+        fn noteChange(s: *Self, share_index: usize, path: []const u8, action: u32, filter: u32) void {
+            if (s.watch_count == 0) return;
+            for (s.watches[0..s.watch_count]) |*watch| {
+                if (watch.fired) continue;
+                if (watch.share != share_index) continue;
+                if (watch.filter & filter == 0) continue;
+                const name = relativeTo(watch.path_(), path, watch.watch_tree) orelse continue;
+                arm(watch, status.SUCCESS, action, name);
+            }
+        }
+
+        /// The same, for a change described by the handle that made it.
+        fn noteOpenChange(s: *Self, open: *const Open, action: u32, filter: u32) void {
+            s.noteChange(open.share, open.path_(), action, filter);
+        }
+
+        /// A client taking back a request. Nothing else outstanding can be
+        /// cancelled, because nothing else is ever left unanswered.
+        fn cancelWatch(s: *Self, c: *Conn, head: hdr.Header) void {
+            for (s.watches[0..s.watch_count]) |*watch| {
+                if (watch.conn != c.token) continue;
+                const named = if (head.flags & hdr.flags.ASYNC_COMMAND != 0)
+                    watch.async_id == head.async_id
+                else
+                    watch.message_id == head.message_id;
+                if (!named) continue;
+                arm(watch, status.CANCELLED, 0, "");
+                return;
+            }
+        }
+
+        /// Closing the directory ends the wait on it — with an answer, because
+        /// a client that hears nothing waits forever.
+        fn endWatches(s: *Self, owner: u64) void {
+            if (s.watch_count == 0) return;
+            for (s.watches[0..s.watch_count]) |*watch| {
+                if (watch.owner == owner) arm(watch, status.NOTIFY_CLEANUP, 0, "");
+            }
+        }
+
+        fn dropWatches(s: *Self, token: poller_mod.Token) void {
+            if (s.watch_count == 0) return;
+            var index = s.watch_count;
+            while (index > 0) {
+                index -= 1;
+                if (s.watches[index].conn != token) continue;
+                s.watch_count -= 1;
+                s.watches[index] = s.watches[s.watch_count];
+            }
+        }
+
+        /// Sends the second half of every request that now has an answer, after
+        /// the frame that produced it — same reason as a break.
+        fn deliverNotifications(s: *Self) void {
+            if (s.watch_count == 0) return;
+            var index = s.watch_count;
+            while (index > 0) {
+                index -= 1;
+                if (!s.watches[index].fired) continue;
+                const watch = s.watches[index];
+                s.watch_count -= 1;
+                s.watches[index] = s.watches[s.watch_count];
+
+                const c = &s.conns[watch.conn];
+                if (!c.active or c.closing) continue;
+                s.sendNotification(c, &watch);
+                s.flush(c);
+            }
+        }
+
+        fn sendNotification(s: *Self, c: *Conn, watch: *const Watch) void {
+            // A change is described by a record no longer than the path that
+            // changed, and the transport and header in front of it.
+            var name_utf16: [limits.path_bytes * 2]u8 = undefined;
+            var name: []const u8 = &.{};
+            if (watch.fired_status == status.SUCCESS) {
+                var windows_name: [limits.path_bytes]u8 = undefined;
+                const utf8 = watch.name_();
+                for (utf8, 0..) |byte, i| windows_name[i] = if (byte == '/') '\\' else byte;
+                name = unicode.toUtf16le(&name_utf16, windows_name[0..utf8.len]) catch return;
+            }
+
+            const record = if (name.len == 0) 0 else 12 + name.len;
+            const body = if (watch.fired_status == status.SUCCESS) 8 + record else 9;
+            if (limits.out_buffer - c.out_len < hdr.transport_header_size + hdr.header_size + body) {
+                log.warn("connection {d}: no room for a change notification", .{c.token});
+                c.closing = true;
+                return;
+            }
+
+            var w = wire.Writer.init(c.out[0..limits.out_buffer]);
+            w.pos = c.out_len;
+            const frame_at = w.pos;
+            w.zeroes(hdr.transport_header_size) catch return;
+            const start = w.pos;
+
+            // A record the client left no room for is not an error: it is told
+            // to look at the directory again instead.
+            const code = if (watch.fired_status == status.SUCCESS and record > watch.output_limit)
+                status.NOTIFY_ENUM_DIR
+            else
+                watch.fired_status;
+
+            hdr.write(&w, .{
+                .status = code,
+                .command = .change_notify,
+                .credits = 1,
+                .flags = hdr.flags.SERVER_TO_REDIR | hdr.flags.ASYNC_COMMAND,
+                .message_id = watch.message_id,
+                .async_id = watch.async_id,
+                .session_id = watch.session_id,
+            }) catch return;
+
+            if (code == status.SUCCESS) {
+                w.u16_(9) catch return; // StructureSize
+                w.u16_(hdr.header_size + 8) catch return; // OutputBufferOffset
+                w.u32_(@intCast(record)) catch return; // OutputBufferLength
+                w.u32_(0) catch return; // NextEntryOffset: one change per answer
+                w.u32_(watch.action) catch return;
+                w.u32_(@intCast(name.len)) catch return; // FileNameLength, in bytes
+                w.blob(name) catch return;
+            } else {
+                writeErrorBody(&w) catch return;
+            }
+
+            const message = w.buf[start..w.pos];
+            s.signBreak(c, watch.session_id, message);
+            hdr.writeFrameLength(w.buf[frame_at..][0..4], @intCast(message.len));
+            c.out_len = w.pos;
+            log.debug("connection {d}: change notified (0x{x:0>8})", .{ c.token, code });
         }
 
         // ------------------------------------------------------ byte-range locks

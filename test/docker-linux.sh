@@ -91,6 +91,22 @@ seen=$(cat /tmp/leasemnt/leased.txt)
     || echo "  FAIL  the client is still serving: $seen"
 kill $holder 2>/dev/null || true
 umount /tmp/leasemnt
+
+echo
+echo "=== change notification ==="
+# smbclient's `notify` is a real implementation of the other half of this:
+# it asks, waits for an answer that cannot come yet, and prints what arrives.
+printf 'new\n' > /tmp/new.txt
+smbclient //127.0.0.1/files -U alice%hunter2 -p 4447 -m SMB2 -c 'notify .' > /tmp/notify.out 2>&1 &
+watcher=$!
+sleep 2
+smbclient //127.0.0.1/files -U alice%hunter2 -p 4447 -m SMB2 \
+    -c 'put /tmp/new.txt watched.txt' >/dev/null 2>&1
+sleep 2
+kill $watcher 2>/dev/null || true
+grep -q "0001 watched.txt" /tmp/notify.out \
+    && echo "  ok    a watching client was told about the new file" \
+    || echo "  FAIL  the watcher saw: $(cat /tmp/notify.out)"
 INNER
 
 docker run --rm --privileged --platform "$platform" \
