@@ -63,7 +63,7 @@ pub fn LoopbackClient(comptime ServerType: type) type {
 
             c.conn.out_len = 0;
             c.server.handleFrame(c.conn, message);
-            return frameBody(c.conn.out[0..c.conn.out_len]);
+            return firstFrame(c.conn.out[0..c.conn.out_len]);
         }
 
         /// Writes one complete transport-framed request into `out` and returns
@@ -94,7 +94,23 @@ pub fn LoopbackClient(comptime ServerType: type) type {
         pub fn sendFrame(c: *Self, frame: []const u8) []const u8 {
             c.conn.out_len = 0;
             c.server.handleFrame(c.conn, frame);
-            return frameBody(c.conn.out[0..c.conn.out_len]);
+            return firstFrame(c.conn.out[0..c.conn.out_len]);
+        }
+
+        /// The break the server sent of its own accord while answering the last
+        /// request, if it sent one. It arrives behind the response, in its own
+        /// transport frame, answering a request that was never made.
+        pub fn breakNotification(c: *Self) ?[]const u8 {
+            const buffer = c.conn.out[0..c.conn.out_len];
+            var at: usize = 0;
+            while (at + hdr.transport_header_size <= buffer.len) {
+                const length = (hdr.frameLength(buffer[at..]) catch return null) orelse return null;
+                const message = buffer[at + hdr.transport_header_size ..][0..length];
+                const head = hdr.parse(message) catch return null;
+                if (head.command == .oplock_break and head.message_id == std.math.maxInt(u64)) return message;
+                at += hdr.transport_header_size + length;
+            }
+            return null;
         }
 
         pub fn negotiate(c: *Self) []const u8 {
@@ -192,6 +208,10 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             disposition: u32 = 1,
             options: u32 = 0,
             attributes: u32 = 0,
+            /// Ask for a lease under this key, the way a 2.1 client does.
+            lease_key: ?[16]u8 = null,
+            /// Ask for a plain oplock instead, the way a 2.0.2 client does.
+            oplock: u8 = 0,
         };
 
         pub fn createBody(args: CreateArgs, out: []u8) []u8 {
@@ -200,7 +220,7 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             var w = wire.Writer.init(out);
             w.u16_(57) catch unreachable;
             w.u8_(0) catch unreachable; // SecurityFlags
-            w.u8_(0) catch unreachable; // RequestedOplockLevel
+            w.u8_(if (args.lease_key != null) 0xFF else args.oplock) catch unreachable;
             w.u32_(2) catch unreachable; // ImpersonationLevel
             w.u64_(0) catch unreachable; // SmbCreateFlags
             w.u64_(0) catch unreachable; // Reserved
@@ -211,9 +231,30 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             w.u32_(args.options) catch unreachable;
             w.u16_(64 + 56) catch unreachable; // NameOffset
             w.u16_(@intCast(name.len)) catch unreachable;
+            const contexts_at = w.pos;
             w.u32_(0) catch unreachable; // CreateContextsOffset
             w.u32_(0) catch unreachable; // CreateContextsLength
             w.blob(name) catch unreachable;
+
+            if (args.lease_key) |key| {
+                // Contexts start 8-aligned, measured from the SMB2 header.
+                while ((64 + w.pos) % 8 != 0) w.u8_(0) catch unreachable;
+                const at = w.pos;
+                w.u32_(0) catch unreachable; // Next
+                w.u16_(16) catch unreachable; // NameOffset
+                w.u16_(4) catch unreachable; // NameLength
+                w.u16_(0) catch unreachable; // Reserved
+                w.u16_(24) catch unreachable; // DataOffset
+                w.u32_(32) catch unreachable; // DataLength
+                w.blob("RqLs") catch unreachable;
+                w.zeroes(4) catch unreachable;
+                w.blob(&key) catch unreachable;
+                w.u32_(0x0000_0007) catch unreachable; // LeaseState: read, handle and write
+                w.u32_(0) catch unreachable; // LeaseFlags
+                w.u64_(0) catch unreachable; // LeaseDuration
+                w.patchInt(u32, contexts_at, @intCast(64 + at)) catch unreachable;
+                w.patchInt(u32, contexts_at + 4, @intCast(w.pos - at)) catch unreachable;
+            }
             return w.written();
         }
 
@@ -368,6 +409,15 @@ pub fn frameBody(frame: []const u8) []const u8 {
     const length = (hdr.frameLength(frame) catch unreachable).?;
     std.debug.assert(length == frame.len - hdr.transport_header_size);
     return frame[hdr.transport_header_size..];
+}
+
+/// The first frame in a buffer, without its transport header. The server may
+/// have written more than one: a break notification follows the response whose
+/// handling decided on it.
+pub fn firstFrame(buffer: []const u8) []const u8 {
+    if (buffer.len == 0) return buffer;
+    const length = (hdr.frameLength(buffer) catch unreachable).?;
+    return buffer[hdr.transport_header_size..][0..length];
 }
 
 pub fn statusOf(response: []const u8) u32 {

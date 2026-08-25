@@ -6,11 +6,13 @@
 //! ceiling is knowable before it runs rather than discovered under load.
 //!
 //! What it speaks: SMB 2.0.2 and 2.1, NTLMv2 authentication (never guest,
-//! never anonymous), HMAC-SHA256 signing, compounded requests, and byte-range
-//! locks that are actually enforced against reads and writes. What it
-//! deliberately does not: oplocks and leases (never granted, so no client
-//! caches data we might invalidate), change notification, DFS, and SMB3 —
-//! the dialect list stops at 2.1 because
+//! never anonymous), HMAC-SHA256 signing, compounded requests, byte-range locks
+//! that are actually enforced against reads and writes, and read caching —
+//! leases for a 2.1 client, level-II oplocks for an older one — taken back with
+//! a break the moment somebody changes the file. What it deliberately does not:
+//! write or handle caching (both need a request parked half-answered while a
+//! client writes back or closes, and there is nowhere to park one), change
+//! notification, DFS, and SMB3 — the dialect list stops at 2.1 because
 //! every 3.x feature a client would then expect (signing over CMAC, negotiate
 //! contexts, preauth integrity, encryption) is a correctness cliff, not an
 //! optimisation.
@@ -49,6 +51,10 @@ pub const Limits = struct {
     max_read: u32 = 64 * 1024,
     max_write: u32 = 64 * 1024,
     max_transact: u32 = 64 * 1024,
+    /// Read leases and level-II oplocks handed out at once. A client that
+    /// cannot have one is simply told so and asks the server every time, so
+    /// this is a cache size, not a correctness limit.
+    max_oplocks: usize = 64,
     /// Byte-range locks held anywhere on the server at once. One shared table
     /// rather than a slice of every connection's ceiling: locks are rare, and a
     /// lock has to be visible to every handle on the file, not just its own.
@@ -166,6 +172,14 @@ pub fn Server(comptime limits: Limits) type {
         /// has locked anything in should stay memory the process never touched.
         locks: [limits.max_locks]Lock = undefined,
         lock_count: usize = 0,
+        /// Read caching handed out to clients, and the breaks owed to them.
+        /// Both are dense, for the same reason the lock table is: every write
+        /// walks the grants, and a server nobody has cached anything from
+        /// should not have touched either table.
+        grants: [limits.max_oplocks]Grant = undefined,
+        grant_count: usize = 0,
+        breaks: [limits.max_oplocks]PendingBreak = undefined,
+        break_count: usize = 0,
         poller: Poller = undefined,
         listen_fd: socket.Handle = socket.invalid,
 
@@ -198,6 +212,12 @@ pub fn Server(comptime limits: Limits) type {
             /// without a copy of the path per lock. Two paths that collided
             /// would lock each other out, never let each other through.
             path_hash: u64 = 0,
+            /// The lease this handle was opened under, if any. A client uses
+            /// one key for every handle it opens on a file, which is how it
+            /// says "these are all me" — writing through one of them must not
+            /// break the caching it is doing through another.
+            lease_key: [16]u8 = @splat(0),
+            has_lease: bool = false,
             is_dir: bool = false,
             can_read: bool = false,
             can_write: bool = false,
@@ -234,6 +254,33 @@ pub fn Server(comptime limits: Limits) type {
             offset: u64 = 0,
             length: u64 = 0,
             exclusive: bool = false,
+        };
+
+        /// Read caching a client was granted on a file, and everything needed
+        /// to take it back without going looking for the handle it belongs to.
+        pub const Grant = struct {
+            share: usize = 0,
+            path_hash: u64 = 0,
+            owner: u64 = 0,
+            conn: poller_mod.Token = 0,
+            session_id: u64 = 0,
+            tree_id: u32 = 0,
+            /// Zero for a level-II oplock, which names the handle instead.
+            lease_key: [16]u8 = @splat(0),
+            is_lease: bool = false,
+        };
+
+        /// A break that has been decided but not yet written. Breaks are not
+        /// sent where they are discovered: the discovery happens in the middle
+        /// of composing a response, and the connection being broken may be the
+        /// one that response is being written into.
+        pub const PendingBreak = struct {
+            conn: poller_mod.Token = 0,
+            session_id: u64 = 0,
+            tree_id: u32 = 0,
+            file_id: u64 = 0,
+            lease_key: [16]u8 = @splat(0),
+            is_lease: bool = false,
         };
 
         pub const Session = struct {
@@ -364,6 +411,8 @@ pub fn Server(comptime limits: Limits) type {
             s.free_slots = .initFull();
             s.unauthenticated = 0;
             s.lock_count = 0;
+            s.grant_count = 0;
+            s.break_count = 0;
             // The connection table is deliberately left alone. Writing even one
             // byte per slot would make the whole pool resident — the slots are
             // a megabyte apart and Linux backs an anonymous fault with a 2 MiB
@@ -720,7 +769,14 @@ pub fn Server(comptime limits: Limits) type {
         /// Everything written here goes out under one 4-byte transport header
         /// covering the whole chain — a compounded response is one frame, not
         /// one per message.
+        /// One transport frame in, one out — and then whatever breaks
+        /// answering it owed to other clients.
         pub fn handleFrame(s: *Self, c: *Conn, message: []const u8) void {
+            s.answerFrame(c, message);
+            s.deliverBreaks();
+        }
+
+        fn answerFrame(s: *Self, c: *Conn, message: []const u8) void {
             var w = wire.Writer.init(c.out[0..limits.out_buffer]);
             w.pos = c.out_len;
 
@@ -772,6 +828,88 @@ pub fn Server(comptime limits: Limits) type {
                 hdr.writeFrameLength(w.buf[frame_at..][0..4], @intCast(payload));
             }
             c.out_len = w.pos;
+        }
+
+        /// Sends the breaks that answering a frame decided on.
+        ///
+        /// They are sent here and not where they were discovered, because
+        /// discovery happens halfway through composing a response: a break for
+        /// a handle on the same connection would land inside that response, and
+        /// one for another connection would be a second writer into a buffer
+        /// the first still holds a cursor into.
+        fn deliverBreaks(s: *Self) void {
+            const owed = s.break_count;
+            s.break_count = 0;
+            for (s.breaks[0..owed]) |pending| {
+                const c = &s.conns[pending.conn];
+                if (!c.active or c.closing) continue;
+                s.sendBreak(c, pending);
+                s.flush(c);
+            }
+        }
+
+        /// One break notification, unsolicited: no request produced it and no
+        /// acknowledgement is asked for. Nothing but read caching is ever
+        /// granted, so there is nothing for a client to write back before it
+        /// lets go — it drops what it cached and carries on.
+        fn sendBreak(s: *Self, c: *Conn, pending: PendingBreak) void {
+            const body_size: usize = if (pending.is_lease) 44 else 24;
+            if (limits.out_buffer - c.out_len < hdr.transport_header_size + hdr.header_size + body_size) {
+                // Nowhere to put it. A client must not go on caching a file
+                // that has changed, and the only other way to tell it so is to
+                // take the connection away: it revalidates when it comes back.
+                log.warn("connection {d}: no room for a break, dropping the connection", .{c.token});
+                c.closing = true;
+                return;
+            }
+
+            var w = wire.Writer.init(c.out[0..limits.out_buffer]);
+            w.pos = c.out_len;
+            const frame_at = w.pos;
+            w.zeroes(hdr.transport_header_size) catch return;
+            const start = w.pos;
+            hdr.write(&w, .{
+                .command = .oplock_break,
+                .credits = 0,
+                .flags = hdr.flags.SERVER_TO_REDIR,
+                // The message id that means "this answers nothing".
+                .message_id = std.math.maxInt(u64),
+                .session_id = pending.session_id,
+                .tree_id = pending.tree_id,
+            }) catch return;
+
+            if (pending.is_lease) {
+                w.u16_(44) catch return; // StructureSize
+                w.u16_(0) catch return; // NewEpoch: a version 1 lease has none
+                w.u32_(0) catch return; // Flags: no acknowledgement required
+                w.blob(&pending.lease_key) catch return;
+                w.u32_(lease_state.read_caching) catch return; // CurrentLeaseState
+                w.u32_(0) catch return; // NewLeaseState: nothing is left
+                w.u32_(0) catch return; // BreakReason
+                w.u32_(0) catch return; // AccessMaskHint
+                w.u32_(0) catch return; // ShareMaskHint
+            } else {
+                w.u16_(24) catch return; // StructureSize
+                w.u8_(oplock_level.none) catch return;
+                w.u8_(0) catch return; // Reserved
+                w.u32_(0) catch return; // Reserved2
+                writeFileId(&w, pending.file_id) catch return;
+            }
+
+            const message = w.buf[start..w.pos];
+            s.signBreak(c, pending.session_id, message);
+            hdr.writeFrameLength(w.buf[frame_at..][0..4], @intCast(message.len));
+            c.out_len = w.pos;
+            log.debug("connection {d}: break sent", .{c.token});
+        }
+
+        /// A break carries no request to take its cue from, so the session's
+        /// own rule decides: a client that demanded signing would throw away an
+        /// unsigned message, which is the one thing a break must not be.
+        fn signBreak(s: *Self, c: *Conn, session_id: u64, message: []u8) void {
+            const session = s.findSession(c, session_id) orelse return;
+            if (!session.established or !session.sign_required) return;
+            signing.sign(signing.algorithmFor(c.dialect), session.session_key, message);
         }
 
         /// Carried across one compound chain: a related request inherits the
@@ -959,6 +1097,9 @@ pub fn Server(comptime limits: Limits) type {
                 .logoff => return s.handleLogoff(ctx),
                 .tree_connect => return s.handleTreeConnect(ctx),
                 .echo => return writeEcho(ctx),
+                // A break acknowledgement is not about a tree, and a client
+                // that sends one may not put a tree id on it.
+                .oplock_break => return writeBreakAck(ctx),
                 else => {},
             }
 
@@ -988,7 +1129,7 @@ pub fn Server(comptime limits: Limits) type {
                 .lock => s.handleLock(ctx),
                 // Not supported, and saying so plainly is the point: a client
                 // that is told "no" falls back, a client left waiting hangs.
-                .ioctl, .change_notify, .oplock_break => status.NOT_SUPPORTED,
+                .ioctl, .change_notify => status.NOT_SUPPORTED,
                 else => status.NOT_IMPLEMENTED,
             };
         }
@@ -1063,7 +1204,12 @@ pub fn Server(comptime limits: Limits) type {
             try w.u16_(@intFromEnum(dialect));
             try w.u16_(0); // NegotiateContextCount (3.1.1 only)
             try w.blob(&s.guid);
-            try w.u32_(hdr.capabilities.LARGE_MTU);
+            // Leases are a 2.1 feature, and a client only asks for one if the
+            // server said it does them. A 2.0.2 client is offered the older
+            // oplock instead, which it asks for without being invited.
+            var caps: u32 = hdr.capabilities.LARGE_MTU;
+            if (dialect == .smb_2_1) caps |= hdr.capabilities.LEASING;
+            try w.u32_(caps);
             try w.u32_(limits.max_transact);
             try w.u32_(limits.max_read);
             try w.u32_(limits.max_write);
@@ -1402,8 +1548,10 @@ pub fn Server(comptime limits: Limits) type {
         fn closeOpen(s: *Self, session: *Session, open: *Open) void {
             _ = session;
             s.releaseLocks(open.id);
+            s.releaseGrant(open.id);
             const share = s.shares[open.share];
             if (open.delete_on_close) {
+                s.breakGrants(open);
                 share.remove(open.handle) catch |err| {
                     log.warn("delete-on-close failed for '{s}': {s}", .{ open.path_(), @errorName(err) });
                 };
@@ -1426,7 +1574,7 @@ pub fn Server(comptime limits: Limits) type {
             const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
             if (structure_size != 57) return status.INVALID_PARAMETER;
             _ = r.u8_() catch return status.INVALID_PARAMETER; // SecurityFlags
-            _ = r.u8_() catch return status.INVALID_PARAMETER; // RequestedOplockLevel
+            const requested_oplock = r.u8_() catch return status.INVALID_PARAMETER;
             _ = r.u32_() catch return status.INVALID_PARAMETER; // ImpersonationLevel
             _ = r.u64_() catch return status.INVALID_PARAMETER; // SmbCreateFlags
             _ = r.u64_() catch return status.INVALID_PARAMETER; // Reserved
@@ -1437,6 +1585,8 @@ pub fn Server(comptime limits: Limits) type {
             const options = r.u32_() catch return status.INVALID_PARAMETER;
             const name_offset = r.u16_() catch return status.INVALID_PARAMETER;
             const name_length = r.u16_() catch return status.INVALID_PARAMETER;
+            const contexts_offset = r.u32_() catch return status.INVALID_PARAMETER;
+            const contexts_length = r.u32_() catch return status.INVALID_PARAMETER;
 
             const request = wire.Reader.init(ctx.msg);
             const raw_name = request.sliceAt(name_offset, name_length) catch return status.INVALID_PARAMETER;
@@ -1494,6 +1644,16 @@ pub fn Server(comptime limits: Limits) type {
             open.path_len = path.len;
             open.path_hash = std.hash.Wyhash.hash(0, path);
 
+            const granted = s.grantCaching(
+                ctx,
+                open,
+                requested_oplock,
+                findLeaseContext(ctx.msg, contexts_offset, contexts_length),
+            );
+            // Opening a file in a way that throws its contents away is a change
+            // to it, so whoever was caching those contents has to hear about it.
+            if (disp == .supersede or disp == .overwrite or disp == .overwrite_if) s.breakGrants(open);
+
             ctx.chain.file_id = @splat(0);
             std.mem.writeInt(u64, ctx.chain.file_id[0..8], open.id, .little);
             std.mem.writeInt(u64, ctx.chain.file_id[8..16], open.id, .little);
@@ -1501,7 +1661,7 @@ pub fn Server(comptime limits: Limits) type {
 
             const meta = opened.meta;
             ctx.w.u16_(89) catch return status.INSUFF_SERVER_RESOURCES; // StructureSize
-            ctx.w.u8_(0) catch return status.INSUFF_SERVER_RESOURCES; // OplockLevel: none granted
+            ctx.w.u8_(granted) catch return status.INSUFF_SERVER_RESOURCES; // OplockLevel
             ctx.w.u8_(0) catch return status.INSUFF_SERVER_RESOURCES; // Flags
             ctx.w.u32_(@intFromEnum(opened.action)) catch return status.INSUFF_SERVER_RESOURCES;
             ctx.w.u64_(meta.created) catch return status.INSUFF_SERVER_RESOURCES;
@@ -1513,9 +1673,35 @@ pub fn Server(comptime limits: Limits) type {
             ctx.w.u32_(meta.attributes.wire()) catch return status.INSUFF_SERVER_RESOURCES;
             ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved2
             writeFileId(ctx.w, open.id) catch return status.INSUFF_SERVER_RESOURCES;
+            const contexts_at = ctx.w.pos;
             ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // CreateContextsOffset
             ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // CreateContextsLength
+
+            if (granted == oplock_level.lease) {
+                const at = ctx.rel();
+                writeLeaseContext(ctx.w, open.lease_key) catch return status.INSUFF_SERVER_RESOURCES;
+                ctx.w.patchInt(u32, contexts_at, at) catch {};
+                ctx.w.patchInt(u32, contexts_at + 4, @intCast(ctx.rel() - at)) catch {};
+            }
             return status.SUCCESS;
+        }
+
+        /// The granted lease, echoed back in the shape it arrived in. The key
+        /// is the client's own; the state is what it actually got, which is
+        /// read caching and nothing else.
+        fn writeLeaseContext(w: *wire.Writer, key: [16]u8) wire.Error!void {
+            try w.u32_(0); // Next: the only context in the answer
+            try w.u16_(create_context_header); // NameOffset
+            try w.u16_(lease_context_name.len); // NameLength
+            try w.u16_(0); // Reserved
+            try w.u16_(create_context_header + 8); // DataOffset, past the padded name
+            try w.u32_(lease_data_size); // DataLength
+            try w.blob(lease_context_name);
+            try w.zeroes(4); // padding to the 8-aligned data
+            try w.blob(&key);
+            try w.u32_(lease_state.read_caching);
+            try w.u32_(0); // LeaseFlags
+            try w.u64_(0); // LeaseDuration
         }
 
         fn handleClose(s: *Self, ctx: *Ctx) u32 {
@@ -1626,6 +1812,7 @@ pub fn Server(comptime limits: Limits) type {
             const request = wire.Reader.init(ctx.msg);
             const data = request.sliceAt(data_offset, length) catch return status.INVALID_PARAMETER;
             const wrote = s.shares[open.share].write(open.handle, offset, data) catch |err| return Share.statusFor(err);
+            s.breakGrants(open);
 
             ctx.w.u16_(17) catch return status.INSUFF_SERVER_RESOURCES;
             ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved
@@ -1875,6 +2062,7 @@ pub fn Server(comptime limits: Limits) type {
                     if (!open.can_write) return status.ACCESS_DENIED;
                     const size = info.parseEndOfFile(buffer) catch return status.INFO_LENGTH_MISMATCH;
                     share.truncate(open.handle, size) catch |err| return Share.statusFor(err);
+                    s.breakGrants(open);
                 },
                 .rename => {
                     const rename = info.parseRename(buffer) catch return status.INFO_LENGTH_MISMATCH;
@@ -1884,8 +2072,14 @@ pub fn Server(comptime limits: Limits) type {
                     const path = unicode.normalizePath(&path_buf, wire_name) catch return status.OBJECT_NAME_INVALID;
                     if (path.len == 0 or path.len > limits.path_bytes) return status.OBJECT_NAME_INVALID;
                     share.rename(open.handle, path, rename.replace) catch |err| return Share.statusFor(err);
+                    // Both names changed: whoever was caching the old one is
+                    // now caching a file that is not there, and whoever was
+                    // caching the new one is caching what this just replaced.
+                    s.breakGrants(open);
                     @memcpy(open.path[0..path.len], path);
                     open.path_len = path.len;
+                    s.renameOpen(open, std.hash.Wyhash.hash(0, path));
+                    s.breakGrants(open);
                 },
                 else => return status.INVALID_INFO_CLASS,
             }
@@ -1899,6 +2093,207 @@ pub fn Server(comptime limits: Limits) type {
         fn writeEcho(ctx: *Ctx) u32 {
             ctx.w.u16_(4) catch return status.INSUFF_SERVER_RESOURCES;
             ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES;
+            return status.SUCCESS;
+        }
+
+        // -------------------------------------------------- leases and oplocks
+
+        const oplock_level = struct {
+            const none: u8 = 0x00;
+            const level2: u8 = 0x01;
+            const exclusive: u8 = 0x08;
+            const batch: u8 = 0x09;
+            const lease: u8 = 0xFF;
+        };
+
+        const lease_state = struct {
+            const read_caching: u32 = 0x0000_0001;
+            const handle_caching: u32 = 0x0000_0002;
+            const write_caching: u32 = 0x0000_0004;
+        };
+
+        /// The lease a client asked for in its CREATE.
+        const LeaseRequest = struct {
+            key: [16]u8,
+            state: u32,
+        };
+
+        const lease_context_name = "RqLs";
+        /// Next, NameOffset, NameLength, Reserved, DataOffset, DataLength.
+        const create_context_header = 16;
+        /// A version 1 lease: key, state, flags, duration.
+        const lease_data_size = 32;
+
+        /// Finds the lease a CREATE asked for among its create contexts. Every
+        /// other context — durable handles, allocation hints, the security
+        /// descriptor — is skipped rather than refused: a client sends what it
+        /// has and expects a server to answer for the parts it understands.
+        fn findLeaseContext(msg: []const u8, offset: u32, length: u32) ?LeaseRequest {
+            if (length < create_context_header) return null;
+            const request = wire.Reader.init(msg);
+            const blob = request.sliceAt(offset, length) catch return null;
+
+            var at: usize = 0;
+            while (at + create_context_header <= blob.len) {
+                const chunk = blob[at..];
+                const next = std.mem.readInt(u32, chunk[0..4], .little);
+                const name_offset = std.mem.readInt(u16, chunk[4..6], .little);
+                const name_length = std.mem.readInt(u16, chunk[6..8], .little);
+                const data_offset = std.mem.readInt(u16, chunk[10..12], .little);
+                const data_length = std.mem.readInt(u32, chunk[12..16], .little);
+
+                const named = @as(usize, name_offset) + name_length <= chunk.len and
+                    name_length == lease_context_name.len and
+                    std.mem.eql(u8, chunk[name_offset..][0..lease_context_name.len], lease_context_name);
+                if (named) {
+                    if (@as(usize, data_offset) + data_length > chunk.len) return null;
+                    if (data_length < lease_data_size) return null;
+                    const data = chunk[data_offset..];
+                    return .{
+                        .key = data[0..16].*,
+                        .state = std.mem.readInt(u32, data[16..20], .little),
+                    };
+                }
+                // A Next that does not move past the header it just described
+                // would be a loop, and a chain of contexts always ends in zero.
+                if (next < create_context_header) break;
+                at += next;
+            }
+            return null;
+        }
+
+        /// Decides what caching a new handle gets, which is never more than the
+        /// right to keep reading what it has already read.
+        ///
+        /// Write caching would mean the newest copy of a file living in a
+        /// client's memory, and handing it to the next reader means waiting for
+        /// that client to write it back — a request this server would have to
+        /// park half-answered, which it has nowhere to do. Read caching needs
+        /// none of that: taking it back is a message the client does not answer.
+        fn grantCaching(s: *Self, ctx: *Ctx, open: *Open, requested: u8, lease: ?LeaseRequest) u8 {
+            if (lease) |request| {
+                // Remembered even when nothing is granted: it is how this
+                // client's other handles on the file are recognised as its own.
+                open.lease_key = request.key;
+                open.has_lease = true;
+                if (request.state & lease_state.read_caching == 0) return oplock_level.none;
+            } else if (requested == oplock_level.none) {
+                return oplock_level.none;
+            }
+            // A directory lease is an SMB 3.x feature, and a client that gets
+            // one for 2.1 would be caching a listing on a promise never made.
+            if (open.is_dir) return oplock_level.none;
+            if (s.grant_count == limits.max_oplocks) return oplock_level.none;
+
+            s.grants[s.grant_count] = .{
+                .share = open.share,
+                .path_hash = open.path_hash,
+                .owner = open.id,
+                .conn = ctx.conn.token,
+                .session_id = ctx.session.?.id,
+                .tree_id = ctx.tree.?.id,
+                .lease_key = if (lease) |request| request.key else @splat(0),
+                .is_lease = lease != null,
+            };
+            s.grant_count += 1;
+            const level = if (lease != null) oplock_level.lease else oplock_level.level2;
+            log.debug("connection {d}: caching 0x{x} asked for, 0x{x} granted on '{s}'", .{
+                ctx.conn.token, requested, level, open.path_(),
+            });
+            return level;
+        }
+
+        /// Takes back every grant on this file except the ones belonging to
+        /// whoever is changing it. A client that opened the same file twice
+        /// under one lease key is one client, and breaking its own cache
+        /// because of its own write would be round trips for nothing.
+        fn breakGrants(s: *Self, open: *const Open) void {
+            if (s.grant_count == 0) return;
+            var index = s.grant_count;
+            while (index > 0) {
+                index -= 1;
+                const grant = s.grants[index];
+                if (grant.share != open.share or grant.path_hash != open.path_hash) continue;
+                if (grant.owner == open.id) continue;
+                if (grant.is_lease and open.has_lease and
+                    std.mem.eql(u8, &grant.lease_key, &open.lease_key)) continue;
+
+                if (s.break_count < limits.max_oplocks) {
+                    s.breaks[s.break_count] = .{
+                        .conn = grant.conn,
+                        .session_id = grant.session_id,
+                        .tree_id = grant.tree_id,
+                        .file_id = grant.owner,
+                        .lease_key = grant.lease_key,
+                        .is_lease = grant.is_lease,
+                    };
+                    s.break_count += 1;
+                } else {
+                    // Unreachable by construction — a grant is dropped as it is
+                    // queued, so the queue can hold every grant at once. If it
+                    // ever were not, a client has to lose its connection rather
+                    // than go on caching a file that has changed underneath it.
+                    s.conns[grant.conn].closing = true;
+                }
+                s.grant_count -= 1;
+                s.grants[index] = s.grants[s.grant_count];
+            }
+        }
+
+        /// Moves a handle, and everything keyed to where it used to be, onto
+        /// its new name. A lock or a grant left behind on the old path would
+        /// guard a name nothing answers to any more.
+        fn renameOpen(s: *Self, open: *Open, path_hash: u64) void {
+            open.path_hash = path_hash;
+            for (s.locks[0..s.lock_count]) |*lock| {
+                if (lock.owner == open.id) lock.path_hash = path_hash;
+            }
+            for (s.grants[0..s.grant_count]) |*grant| {
+                if (grant.owner == open.id) grant.path_hash = path_hash;
+            }
+        }
+
+        /// A handle's grant goes when the handle does. Nothing is sent: the
+        /// client asking for the close is the one that held it.
+        fn releaseGrant(s: *Self, owner: u64) void {
+            if (s.grant_count == 0) return;
+            var index = s.grant_count;
+            while (index > 0) {
+                index -= 1;
+                if (s.grants[index].owner != owner) continue;
+                s.grant_count -= 1;
+                s.grants[index] = s.grants[s.grant_count];
+            }
+        }
+
+        /// A client acknowledging a break it was never asked to acknowledge.
+        /// Nothing this server grants requires one, so there is nothing to
+        /// undo; the answer exists so the client stops waiting for it.
+        fn writeBreakAck(ctx: *Ctx) u32 {
+            var r = wire.Reader.init(ctx.body);
+            const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
+            switch (structure_size) {
+                24 => {
+                    r.skip(6) catch return status.INVALID_PARAMETER; // OplockLevel, Reserved
+                    const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
+                    ctx.w.u16_(24) catch return status.INSUFF_SERVER_RESOURCES;
+                    ctx.w.u8_(oplock_level.none) catch return status.INSUFF_SERVER_RESOURCES;
+                    ctx.w.u8_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved
+                    ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved2
+                    ctx.w.blob(raw_id) catch return status.INSUFF_SERVER_RESOURCES;
+                },
+                36 => {
+                    r.skip(6) catch return status.INVALID_PARAMETER; // Reserved, Flags
+                    const key = r.take(16) catch return status.INVALID_PARAMETER;
+                    ctx.w.u16_(36) catch return status.INSUFF_SERVER_RESOURCES;
+                    ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved
+                    ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Flags
+                    ctx.w.blob(key) catch return status.INSUFF_SERVER_RESOURCES;
+                    ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // LeaseState: none
+                    ctx.w.u64_(0) catch return status.INSUFF_SERVER_RESOURCES; // LeaseDuration
+                },
+                else => return status.INVALID_PARAMETER,
+            }
             return status.SUCCESS;
         }
 

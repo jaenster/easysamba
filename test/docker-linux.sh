@@ -52,6 +52,45 @@ result=$(python3 /work/test/lockcheck.py /tmp/lockmnt/locked.txt)
     && echo "  ok    a second process is refused the locked range" \
     || echo "  FAIL  second process saw: $result"
 umount /tmp/lockmnt
+
+echo
+echo "=== leases ==="
+# The point of a lease is that the client stops asking. Metadata caching is
+# turned up to a minute so that nothing but a break from the server can make
+# the client notice a change -- if the break never arrives, or arrives in a
+# shape the client throws away, it keeps serving the old contents and this
+# fails.
+printf 'before\n' > /tmp/smbshare/leased.txt
+printf 'after\n' > /tmp/second.txt
+/easysambad --port 4447 --bind 127.0.0.1 \
+    --share files=/tmp/smbshare --user alice:hunter2 --log debug > /tmp/lease.log 2>&1 &
+sleep 1
+mkdir -p /tmp/leasemnt
+mount -t cifs //127.0.0.1/files /tmp/leasemnt \
+    -o "username=alice,password=hunter2,port=4447,vers=2.1"
+
+# Something has to hold the file open, or the client hands the lease back as
+# soon as the read finishes and there is nothing left to break.
+sleep 30 < /tmp/leasemnt/leased.txt &
+holder=$!
+sleep 1
+[ "$(cat /tmp/leasemnt/leased.txt)" = "before" ] && echo "  ok    the leased file reads"
+grep -q "granted on" /tmp/lease.log \
+    && echo "  ok    the client asked for a lease and got one" \
+    || echo "  FAIL  no lease was granted"
+
+smbclient //127.0.0.1/files -U alice%hunter2 -p 4447 -m SMB2 \
+    -c 'put /tmp/second.txt leased.txt' >/dev/null 2>&1
+sleep 1
+grep -q "break sent" /tmp/lease.log \
+    && echo "  ok    the server broke the lease when another client wrote" \
+    || echo "  FAIL  no break was sent"
+seen=$(cat /tmp/leasemnt/leased.txt)
+[ "$seen" = "after" ] \
+    && echo "  ok    the client dropped what it had cached" \
+    || echo "  FAIL  the client is still serving: $seen"
+kill $holder 2>/dev/null || true
+umount /tmp/leasemnt
 INNER
 
 docker run --rm --privileged --platform "$platform" \

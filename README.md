@@ -248,7 +248,18 @@ and closes a file in a single round trip.
 
 Implemented: negotiate, session setup, logoff, tree connect/disconnect, create,
 close, flush, read, write, lock, query directory, query info, set info, echo,
-cancel.
+cancel, oplock break.
+
+Clients cache. A 2.1 client is offered a lease and an older one a level-II
+oplock, both granting the right to keep reading what it has already read — and
+both taken back with a break notification the moment another client writes,
+truncates, renames or deletes the file. A break needs no acknowledgement,
+because nothing is granted that a client would have to hand back first: it drops
+what it cached and carries on. A client's own writes never break its own cache,
+which is what the lease key is for — every handle a client opens on a file
+carries the same one, so the server can tell one client with two handles from
+two clients. Both real clients take it up: `mount_smbfs` and the kernel `cifs`
+module each ask for a lease and get one.
 
 Byte-range locks are real, not acknowledged and forgotten. A lock belongs to the
 handle that took it and is visible to every other handle on the file, including
@@ -268,8 +279,11 @@ silence:
   then expect — CMAC signing, negotiate contexts, preauth integrity, encryption
   — is a correctness cliff rather than an optimisation, and a client offered 2.1
   uses 2.1.
-* **Oplocks and leases.** Never granted, so no client caches data this server
-  might invalidate.
+* **Write and handle caching.** Only read caching is granted. Giving a client
+  the newest copy of a file means the next reader waits for that client to write
+  it back, and giving it the right to keep a handle open means the next opener
+  waits for it to close — both are requests parked half-answered, which this
+  server has nowhere to put.
 * **Change notification, DFS, named pipes.** `IPC$` connects and is empty, which
   is what a client needs to get on with mounting a real share. Browsing a server
   for its share list needs RPC over that pipe and does not work; mounting a share
@@ -299,11 +313,11 @@ silence:
 
 ```sh
 zig build                                # zig-out/bin/easysambad
-zig build test                           # 145 unit and protocol tests
+zig build test                           # 153 unit and protocol tests
 zig build check -Dtarget=x86_64-linux    # type-check another platform's backend
 zig build bench -Doptimize=ReleaseFast   # the numbers above
 test/integration.sh                      # mount it for real and use it
-test/docker-linux.sh                     # same, on Linux, both clients, plus locks
+test/docker-linux.sh                     # same, on Linux: both clients, locks, leases
 test/footprint.sh                        # memory and CPU while serving a GiB
 ```
 

@@ -1029,3 +1029,182 @@ test "a lock on a directory, or on nothing at all, is refused" {
     // Neither shared nor exclusive nor unlock: nothing to do and no way to say so.
     try testing.expectEqual(status.INVALID_PARAMETER, c.client.lock(&.{.{ .offset = 0, .length = 4, .flags = 0 }}));
 }
+
+/// Offsets into a CREATE response body: OplockLevel, then the two fields that
+/// say where the answered create contexts are.
+const create_oplock_at = 2;
+const create_contexts_offset_at = 80;
+const create_contexts_length_at = 84;
+
+fn createWithLease(c: *Harness, path: []const u8, key: [16]u8, mask: u32) []const u8 {
+    var buf: [512]u8 = undefined;
+    const response = c.client.send(.create, Client.createBody(.{
+        .path = path,
+        .access_mask = mask,
+        .lease_key = key,
+    }, &buf));
+    if (statusOf(response) == status.SUCCESS) @memcpy(&c.client.file_id, response[64 + 64 ..][0..16]);
+    return response;
+}
+
+test "a lease request is answered with read caching under the client's own key" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const key: [16]u8 = @splat(0xA5);
+
+    const response = createWithLease(c, "notes.txt", key, 0x0012_0089);
+    try testing.expectEqual(status.SUCCESS, statusOf(response));
+
+    const body = bodyOf(response);
+    try testing.expectEqual(@as(u8, 0xFF), body[create_oplock_at]); // SMB2_OPLOCK_LEVEL_LEASE
+    const contexts_at = std.mem.readInt(u32, body[create_contexts_offset_at..][0..4], .little);
+    const contexts_len = std.mem.readInt(u32, body[create_contexts_length_at..][0..4], .little);
+    try testing.expectEqual(@as(u32, 56), contexts_len);
+
+    // Offsets in a response are measured from the start of the message.
+    const context = response[contexts_at..][0..contexts_len];
+    try testing.expectEqualStrings("RqLs", context[16..20]);
+    try testing.expectEqualSlices(u8, &key, context[24..40]);
+    // Read caching, and nothing else, whatever the client asked for.
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, context[40..44], .little));
+    try testing.expectEqual(@as(usize, 1), c.server.grant_count);
+}
+
+test "a write from somebody else breaks the lease" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const key: [16]u8 = @splat(0x11);
+
+    try testing.expectEqual(status.SUCCESS, statusOf(createWithLease(c, "notes.txt", key, 0x0012_0089)));
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "changed")));
+    const notification = c.client.breakNotification() orelse return error.NoBreakSent;
+    const body = bodyOf(notification);
+    try testing.expectEqual(@as(u16, 44), std.mem.readInt(u16, body[0..2], .little));
+    try testing.expectEqualSlices(u8, &key, body[8..24]);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, body[24..28], .little)); // was read caching
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, body[28..32], .little)); // and now nothing
+
+    // The grant is gone with it, so a second write has nothing left to break.
+    try testing.expectEqual(@as(usize, 0), c.server.grant_count);
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "again")));
+    try testing.expect(c.client.breakNotification() == null);
+}
+
+test "a client writing through its own lease key is not broken by itself" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const key: [16]u8 = @splat(0x22);
+
+    try testing.expectEqual(status.SUCCESS, statusOf(createWithLease(c, "notes.txt", key, 0x0012_0089)));
+    // The same client, the same lease, a second handle: one client, not two.
+    try testing.expectEqual(status.SUCCESS, statusOf(createWithLease(c, "notes.txt", key, read_write)));
+
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "mine")));
+    try testing.expect(c.client.breakNotification() == null);
+    try testing.expectEqual(@as(usize, 2), c.server.grant_count);
+}
+
+test "a client that asks for an oplock rather than a lease gets level II" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    var buf: [512]u8 = undefined;
+    // FILE_OPEN_BATCH_OPLOCK: more than this server will ever hand out.
+    const response = c.client.send(.create, Client.createBody(.{
+        .path = "notes.txt",
+        .oplock = 0x09,
+    }, &buf));
+    try testing.expectEqual(status.SUCCESS, statusOf(response));
+    try testing.expectEqual(@as(u8, 0x01), bodyOf(response)[create_oplock_at]);
+    @memcpy(&c.client.file_id, response[64 + 64 ..][0..16]);
+    const holder = c.client.file_id;
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "changed")));
+
+    const notification = c.client.breakNotification() orelse return error.NoBreakSent;
+    const body = bodyOf(notification);
+    try testing.expectEqual(@as(u16, 24), std.mem.readInt(u16, body[0..2], .little));
+    try testing.expectEqual(@as(u8, 0), body[2]); // nothing left
+    try testing.expectEqualSlices(u8, holder[0..8], body[8..16]);
+}
+
+test "truncating and renaming break a lease the same way writing does" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const key: [16]u8 = @splat(0x33);
+
+    try testing.expectEqual(status.SUCCESS, statusOf(createWithLease(c, "notes.txt", key, 0x0012_0089)));
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+
+    var payload: [8]u8 = @splat(0);
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.setInfo(.end_of_file, &payload)));
+    try testing.expect(c.client.breakNotification() != null);
+
+    // And again for a rename, which changes the name two clients disagree about.
+    try testing.expectEqual(status.SUCCESS, statusOf(createWithLease(c, "notes.txt", key, 0x0012_0089)));
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write | 0x0001_0000 }));
+    var rename_buf: [64]u8 = undefined;
+    var w = wire.Writer.init(&rename_buf);
+    try w.u8_(1); // ReplaceIfExists
+    try w.zeroes(7);
+    try w.u64_(0); // RootDirectory
+    var name_buf: [32]u8 = undefined;
+    const name = try unicode.toUtf16le(&name_buf, "moved.txt");
+    try w.u32_(@intCast(name.len));
+    try w.blob(name);
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.setInfo(.rename, w.written())));
+    try testing.expect(c.client.breakNotification() != null);
+}
+
+test "a lease goes when the handle that held it closes" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const key: [16]u8 = @splat(0x44);
+
+    try testing.expectEqual(status.SUCCESS, statusOf(createWithLease(c, "notes.txt", key, 0x0012_0089)));
+    try testing.expectEqual(@as(usize, 1), c.server.grant_count);
+    _ = c.client.closeFile();
+    try testing.expectEqual(@as(usize, 0), c.server.grant_count);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "nobody is caching this")));
+    try testing.expect(c.client.breakNotification() == null);
+}
+
+test "a directory is never leased" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    const key: [16]u8 = @splat(0x55);
+
+    var buf: [512]u8 = undefined;
+    const response = c.client.send(.create, Client.createBody(.{
+        .path = "docs",
+        .options = 0x0000_0001, // FILE_DIRECTORY_FILE
+        .lease_key = key,
+    }, &buf));
+    try testing.expectEqual(status.SUCCESS, statusOf(response));
+    try testing.expectEqual(@as(u8, 0), bodyOf(response)[create_oplock_at]);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bodyOf(response)[create_contexts_length_at..][0..4], .little));
+    try testing.expectEqual(@as(usize, 0), c.server.grant_count);
+}
+
+test "a break on a signed session is signed" {
+    const c = try setup(.{}, "alice:" ++ password);
+    defer c.destroy(testing.allocator);
+    _ = c.client.negotiate();
+    try testing.expectEqual(status.SUCCESS, c.client.login("alice", password, .raw, true));
+    try testing.expectEqual(status.SUCCESS, c.client.treeConnect("data"));
+    const key: [16]u8 = @splat(0x66);
+
+    try testing.expectEqual(status.SUCCESS, statusOf(createWithLease(c, "notes.txt", key, 0x0012_0089)));
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "changed")));
+
+    const notification = c.client.breakNotification() orelse return error.NoBreakSent;
+    var copy: [256]u8 = undefined;
+    @memcpy(copy[0..notification.len], notification);
+    try testing.expect(signing.verify(.hmac_sha256, c.client.sign_key.?, copy[0..notification.len]));
+}
