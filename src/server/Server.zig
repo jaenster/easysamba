@@ -1374,7 +1374,7 @@ pub fn Server(comptime limits: Limits) type {
             _ = r.u32_() catch return status.INVALID_PARAMETER; // Channel
             const blob_offset = r.u16_() catch return status.INVALID_PARAMETER;
             const blob_length = r.u16_() catch return status.INVALID_PARAMETER;
-            _ = r.u64_() catch return status.INVALID_PARAMETER; // PreviousSessionId
+            const previous_session_id = r.u64_() catch return status.INVALID_PARAMETER;
 
             const request = wire.Reader.init(ctx.msg);
             const blob = request.sliceAt(blob_offset, blob_length) catch return status.INVALID_PARAMETER;
@@ -1382,7 +1382,7 @@ pub fn Server(comptime limits: Limits) type {
 
             return switch (ntlm.messageType(token) orelse return status.LOGON_FAILURE) {
                 .negotiate => s.beginAuth(ctx, token, blob, security_mode),
-                .authenticate => s.finishAuth(ctx, token, session_id),
+                .authenticate => s.finishAuth(ctx, token, session_id, previous_session_id),
                 else => status.LOGON_FAILURE,
             };
         }
@@ -1438,7 +1438,7 @@ pub fn Server(comptime limits: Limits) type {
             return status.MORE_PROCESSING_REQUIRED;
         }
 
-        fn finishAuth(s: *Self, ctx: *Ctx, token: []const u8, session_id: u64) u32 {
+        fn finishAuth(s: *Self, ctx: *Ctx, token: []const u8, session_id: u64, previous_session_id: u64) u32 {
             const session = s.findSession(ctx.conn, session_id) orelse return status.USER_SESSION_DELETED;
             if (session.established) return status.INVALID_PARAMETER;
 
@@ -1483,6 +1483,7 @@ pub fn Server(comptime limits: Limits) type {
 
             ctx.session = session;
             ctx.w.patchInt(u64, ctx.start + 40, session.id) catch {};
+            s.dropPreviousSession(session, previous_session_id);
 
             var wrapped: [64]u8 = undefined;
             const payload = if (session.raw_ntlm)
@@ -1545,6 +1546,38 @@ pub fn Server(comptime limits: Limits) type {
                 if (session.active and session.id == id) return session;
             }
             return null;
+        }
+
+        /// A client that lost its connection and came back says which session
+        /// it used to have, so the handles and locks it left behind can go now
+        /// rather than when the dead connection is finally noticed.
+        ///
+        /// The user has to match. Otherwise this would be a way for anyone who
+        /// can log in to close somebody else's session by guessing a number.
+        fn dropPreviousSession(s: *Self, current: *const Session, previous_id: u64) void {
+            if (previous_id == 0 or previous_id == current.id) return;
+
+            var taken = s.takenSlots();
+            var live = taken.iterator(.{});
+            while (live.next()) |index| {
+                const c = &s.conns[index];
+                if (!c.active) continue;
+                for (&c.sessions) |*session| {
+                    if (!session.active or session.id != previous_id) continue;
+                    if (!session.established) return;
+                    if (!std.mem.eql(u8, session.user_(), current.user_())) {
+                        log.warn("connection {d}: '{s}' tried to close a session belonging to '{s}'", .{
+                            c.token, current.user_(), session.user_(),
+                        });
+                        return;
+                    }
+                    log.info("connection {d}: '{s}' reconnected; the previous session is closed", .{
+                        c.token, current.user_(),
+                    });
+                    s.endSession(session);
+                    return;
+                }
+            }
         }
 
         fn endSession(s: *Self, session: *Session) void {

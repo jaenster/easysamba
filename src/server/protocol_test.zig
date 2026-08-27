@@ -185,6 +185,48 @@ test "a null session is refused outright" {
     try testing.expectEqual(status.LOGON_FAILURE, statusOf(second));
 }
 
+test "a client that reconnects takes its old session down with it" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    // The first session holds a handle, the way a client that then loses its
+    // connection would.
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+    try testing.expectEqual(status.SUCCESS, c.client.lock(&.{.{
+        .offset = 0,
+        .length = 4,
+        .flags = loopback.lock_flags.exclusive | loopback.lock_flags.fail_immediately,
+    }}));
+    const old_session = c.client.session_id;
+    try testing.expectEqual(@as(usize, 1), c.server.lock_count);
+
+    var again = c.client;
+    again.session_id = 0;
+    again.tree_id = 0;
+    try testing.expectEqual(status.SUCCESS, again.loginAfter("alice", password, .raw, false, old_session));
+
+    // The lock and the handle went with the session it named.
+    try testing.expectEqual(@as(usize, 0), c.server.lock_count);
+    try testing.expect(!c.conn.sessions[0].established);
+}
+
+test "one account cannot close another's session by naming it" {
+    const c = try setup(.{}, "alice:" ++ password ++ "\nbob:" ++ password ++ ":ro");
+    defer c.destroy(testing.allocator);
+    _ = c.client.negotiate();
+    try testing.expectEqual(status.SUCCESS, c.client.login("alice", password, .raw, false));
+    const alices = c.client.session_id;
+
+    var mallory = c.client;
+    mallory.session_id = 0;
+    mallory.tree_id = 0;
+    try testing.expectEqual(status.SUCCESS, mallory.loginAfter("bob", password, .raw, false, alices));
+
+    // Alice's session is still there, and still hers.
+    try testing.expect(c.conn.sessions[0].established);
+    try testing.expectEqualStrings("alice", c.conn.sessions[0].user_());
+}
+
 test "commands before authentication are refused" {
     const c = try setup(.{}, "alice:" ++ password);
     defer c.destroy(testing.allocator);

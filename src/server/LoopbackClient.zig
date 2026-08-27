@@ -224,6 +224,12 @@ pub fn LoopbackClient(comptime ServerType: type) type {
         }
 
         pub fn sessionSetupBody(blob: []const u8, out: []u8, sign_required: bool) []u8 {
+            return sessionSetupBodyAfter(blob, out, sign_required, 0);
+        }
+
+        /// The same, quoting the session this client had before it lost its
+        /// connection.
+        pub fn sessionSetupBodyAfter(blob: []const u8, out: []u8, sign_required: bool, previous: u64) []u8 {
             var w = wire.Writer.init(out);
             w.u16_(25) catch unreachable;
             w.u8_(0) catch unreachable; // Flags
@@ -232,7 +238,7 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             w.u32_(0) catch unreachable; // Channel
             w.u16_(64 + 24) catch unreachable; // SecurityBufferOffset
             w.u16_(@intCast(blob.len)) catch unreachable;
-            w.u64_(0) catch unreachable; // PreviousSessionId
+            w.u64_(previous) catch unreachable; // PreviousSessionId
             w.blob(blob) catch unreachable;
             return w.written();
         }
@@ -240,6 +246,10 @@ pub fn LoopbackClient(comptime ServerType: type) type {
         /// The two-round NTLMv2 exchange, in whichever wrapping the caller
         /// wants to exercise.
         pub fn login(c: *Self, user: []const u8, pass: []const u8, wrap: Wrapping, sign: bool) u32 {
+            return c.loginAfter(user, pass, wrap, sign, 0);
+        }
+
+        pub fn loginAfter(c: *Self, user: []const u8, pass: []const u8, wrap: Wrapping, sign: bool, previous: u64) u32 {
             var negotiate_msg: [40]u8 = @splat(0);
             @memcpy(negotiate_msg[0..8], ntlm.signature);
             std.mem.writeInt(u32, negotiate_msg[8..12], 1, .little);
@@ -268,7 +278,7 @@ pub fn LoopbackClient(comptime ServerType: type) type {
                 .spnego => spnego.buildNegTokenResp(&wrapped, .accept_incomplete, false, auth_msg) catch unreachable,
             };
 
-            const second = c.send(.session_setup, sessionSetupBody(second_blob, &body, sign));
+            const second = c.send(.session_setup, sessionSetupBodyAfter(second_blob, &body, sign, previous));
             const code = statusOf(second);
             if (code == status.SUCCESS and sign) {
                 c.sign_key = sessionKey(nt_hash, user, challenge, &client_blob);
