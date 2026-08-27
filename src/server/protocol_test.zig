@@ -269,7 +269,133 @@ test "IPC$ connects as an empty pipe share and refuses every open" {
     });
     try testing.expectEqual(@as(u8, 2), bodyOf(response)[2]); // SHARE_TYPE_PIPE
 
-    try testing.expectEqual(status.ACCESS_DENIED, c.client.open(.{ .path = "srvsvc" }));
+    // The one pipe there is opens; anything else does not exist.
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "srvsvc" }));
+    try testing.expectEqual(status.OBJECT_NAME_NOT_FOUND, c.client.open(.{ .path = "wkssvc" }));
+}
+
+/// A DCE/RPC bind, as small as one is allowed to be: one context, offering
+/// NDR and nothing else.
+fn bindRequest(out: []u8) []const u8 {
+    var w = wire.Writer.init(out);
+    w.u8_(5) catch unreachable; // version
+    w.u8_(0) catch unreachable;
+    w.u8_(11) catch unreachable; // BIND
+    w.u8_(0x03) catch unreachable; // first and last fragment
+    w.blob(&.{ 0x10, 0, 0, 0 }) catch unreachable; // little-endian
+    w.u16_(72) catch unreachable; // fragment length
+    w.u16_(0) catch unreachable;
+    w.u32_(1) catch unreachable; // call id
+    w.u16_(4280) catch unreachable;
+    w.u16_(4280) catch unreachable;
+    w.u32_(0) catch unreachable;
+    w.u8_(1) catch unreachable; // one context
+    w.u8_(0) catch unreachable;
+    w.u16_(0) catch unreachable;
+    w.u16_(0) catch unreachable; // context id
+    w.u8_(1) catch unreachable; // one transfer syntax
+    w.u8_(0) catch unreachable;
+    w.zeroes(20) catch unreachable; // abstract syntax: srvsvc
+    w.blob(&.{
+        0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11,
+        0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48, 0x60,
+    }) catch unreachable;
+    w.u32_(2) catch unreachable; // NDR version 2
+    return w.written();
+}
+
+/// NetShareEnumAll at level 1, with no server name and no resume handle.
+fn shareEnumRequest(out: []u8) []const u8 {
+    var w = wire.Writer.init(out);
+    w.u8_(5) catch unreachable;
+    w.u8_(0) catch unreachable;
+    w.u8_(0) catch unreachable; // REQUEST
+    w.u8_(0x03) catch unreachable;
+    w.blob(&.{ 0x10, 0, 0, 0 }) catch unreachable;
+    w.u16_(40) catch unreachable;
+    w.u16_(0) catch unreachable;
+    w.u32_(2) catch unreachable; // call id
+    w.u32_(0) catch unreachable; // allocation hint
+    w.u16_(0) catch unreachable; // context id
+    w.u16_(15) catch unreachable; // NetShareEnumAll
+    w.u32_(0) catch unreachable; // no server name
+    w.u32_(1) catch unreachable; // level 1
+    w.u32_(0) catch unreachable; // EntriesRead
+    w.u32_(0) catch unreachable; // no buffer
+    w.u32_(0xFFFF) catch unreachable; // preferred maximum length
+    w.u32_(0) catch unreachable; // no resume handle
+    return w.written();
+}
+
+fn openSrvsvc(c: *Harness) !void {
+    _ = c.client.negotiate();
+    try testing.expectEqual(status.SUCCESS, c.client.login("alice", password, .raw, false));
+    try testing.expectEqual(status.SUCCESS, c.client.treeConnect("IPC$"));
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "srvsvc" }));
+}
+
+test "a bind written to the pipe is answered by a read" {
+    const c = try setup(.{}, "alice:" ++ password);
+    defer c.destroy(testing.allocator);
+    try openSrvsvc(c);
+
+    var buf: [128]u8 = undefined;
+    const written = c.client.writeFile(0, bindRequest(&buf));
+    try testing.expectEqual(status.SUCCESS, statusOf(written));
+
+    const read = c.client.readFile(0, 1024);
+    try testing.expectEqual(status.SUCCESS, statusOf(read));
+    const at = std.mem.readInt(u8, bodyOf(read)[2..3], .little);
+    const length = std.mem.readInt(u32, bodyOf(read)[4..8], .little);
+    const pdu = read[at..][0..length];
+    try testing.expectEqual(@as(u8, 12), pdu[2]); // BIND_ACK
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, pdu[12..16], .little)); // the call it answers
+
+    // And the answer is only handed over once.
+    try testing.expectEqual(status.PIPE_EMPTY, statusOf(c.client.readFile(0, 1024)));
+}
+
+test "a share list comes back through the pipe" {
+    const c = try setup(.{}, "alice:" ++ password);
+    defer c.destroy(testing.allocator);
+    try openSrvsvc(c);
+
+    var buf: [128]u8 = undefined;
+    // One round trip, the way a client asks when it knows there is an answer.
+    const response = c.client.ioctl(0x0011_C017, shareEnumRequest(&buf));
+    try testing.expectEqual(status.SUCCESS, statusOf(response));
+
+    const pdu = loopback.ioctlOutput(response);
+    try testing.expectEqual(@as(u8, 2), pdu[2]); // RESPONSE
+    const stub = pdu[24..];
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, stub[0..4], .little)); // level 1
+    // One real share, plus IPC$.
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, stub[12..16], .little));
+
+    // The names are in there, as UTF-16, in the order the shares were added.
+    var utf8: [64]u8 = undefined;
+    const first_name_at = 24 + 24 + 12;
+    const name = try unicode.toUtf8(&utf8, stub[first_name_at..][0..8]);
+    try testing.expectEqualStrings("data", name);
+}
+
+test "reading a pipe nothing was written to is refused" {
+    const c = try setup(.{}, "alice:" ++ password);
+    defer c.destroy(testing.allocator);
+    try openSrvsvc(c);
+    try testing.expectEqual(status.PIPE_EMPTY, statusOf(c.client.readFile(0, 1024)));
+}
+
+test "a pipe handle is not a file handle" {
+    const c = try setup(.{}, "alice:" ++ password);
+    defer c.destroy(testing.allocator);
+    try openSrvsvc(c);
+
+    // Every other control code is still refused on a pipe.
+    try testing.expectEqual(status.NOT_SUPPORTED, statusOf(c.client.ioctl(0x0014_0078, &.{})));
+    // And closing it gives the handle back without touching an adapter.
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.closeFile()));
+    try testing.expectEqual(status.FILE_CLOSED, statusOf(c.client.readFile(0, 16)));
 }
 
 test "open, read and close an existing file" {

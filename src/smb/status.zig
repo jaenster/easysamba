@@ -28,6 +28,8 @@ pub const END_OF_FILE: Status = 0xC000_0011;
 pub const MORE_PROCESSING_REQUIRED: Status = 0xC000_0016;
 pub const ACCESS_DENIED: Status = 0xC000_0022;
 pub const BUFFER_TOO_SMALL: Status = 0xC000_0023;
+/// Nothing has been written to the pipe, so there is nothing to read from it.
+pub const PIPE_EMPTY: Status = 0xC000_00D9;
 pub const OBJECT_NAME_INVALID: Status = 0xC000_0033;
 pub const OBJECT_NAME_NOT_FOUND: Status = 0xC000_0034;
 pub const OBJECT_NAME_COLLISION: Status = 0xC000_0035;

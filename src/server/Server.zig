@@ -12,8 +12,9 @@
 //! leases for a 2.1 client, level-II oplocks for an older one — and taken back
 //! with a break the moment somebody changes the file. Change notification is
 //! answered asynchronously, which is the one place a request outlives the
-//! frame that carried it, and a copy inside a share is made by the server
-//! rather than dragged through the client.
+//! frame that carried it. A copy inside a share is made by the server rather
+//! than dragged through the client, and the share list is answered over the
+//! one named pipe that exists.
 //!
 //! What it deliberately does not: write or handle caching, both of which need
 //! a request parked half-answered while a client writes back or closes, and
@@ -37,6 +38,7 @@ const ntlm = @import("../auth/ntlm.zig");
 const spnego = @import("../auth/spnego.zig");
 const Authenticator = @import("../auth/Authenticator.zig");
 const Share = @import("../vfs/Share.zig");
+const pipe = @import("pipe.zig");
 
 const poller_mod = @import("../net/poller.zig");
 const socket = @import("../net/socket.zig");
@@ -184,11 +186,10 @@ const query_dir_flags = struct {
 
 /// The tree index that means IPC$ rather than a real share.
 ///
-/// There is no named-pipe support here and there is not going to be, but a
-/// client that cannot connect IPC$ at all behaves worse than one that connects
-/// it and finds nothing: Windows opens it as part of establishing a session,
-/// and macOS asks for it on every mount. So it exists, it is empty, and
-/// everything anyone tries to open on it is refused.
+/// It is not backed by an adapter and has no files on it. What it has is one
+/// named pipe, which is where a client asks what shares exist — and Windows
+/// connects it as part of establishing a session whether it means to ask
+/// anything or not.
 const ipc_share: usize = std.math.maxInt(usize);
 const ipc_name = "IPC$";
 
@@ -280,6 +281,10 @@ pub fn Server(comptime limits: Limits) type {
             lease_key: [16]u8 = @splat(0),
             has_lease: bool = false,
             is_dir: bool = false,
+            /// A handle on IPC$ names a pipe rather than a file, and every
+            /// operation on it is answered here rather than by an adapter.
+            is_pipe: bool = false,
+            pipe_state: pipe.State = .{},
             can_read: bool = false,
             can_write: bool = false,
             delete_on_close: bool = false,
@@ -1244,9 +1249,12 @@ pub fn Server(comptime limits: Limits) type {
             if (ctx.tree.?.share == ipc_share) {
                 return switch (command) {
                     .tree_disconnect => s.handleTreeDisconnect(ctx),
-                    // Every named pipe a client might ask for (srvsvc, wkssvc,
-                    // lsarpc) would be an RPC endpoint we do not implement.
-                    .create => status.ACCESS_DENIED,
+                    .create => s.handlePipeCreate(ctx),
+                    .write => s.handlePipeWrite(ctx),
+                    .read => s.handlePipeRead(ctx),
+                    .ioctl => s.handlePipeIoctl(ctx),
+                    .close => s.handleClose(ctx),
+                    .flush => s.handleFlush(ctx),
                     else => status.NOT_SUPPORTED,
                 };
             }
@@ -1622,13 +1630,18 @@ pub fn Server(comptime limits: Limits) type {
             tree.* = .{ .active = true, .id = @intCast(s.nextId() & 0xFFFF_FFFF), .share = share_index };
             if (tree.id == 0) tree.id = 1;
 
-            const writable = !is_ipc and !s.shares[share_index].read_only and !session.account.read_only;
+            // A pipe is written to as a matter of course — asking it a
+            // question is a write — so IPC$ is never handed back read-only,
+            // whatever the account may do with files.
+            const writable = if (is_ipc) true else !s.shares[share_index].read_only and !session.account.read_only;
 
             ctx.w.patchInt(u32, ctx.start + 36, tree.id) catch {};
             ctx.w.u16_(16) catch return status.INSUFF_SERVER_RESOURCES; // StructureSize
             ctx.w.u8_(if (is_ipc) 2 else 1) catch return status.INSUFF_SERVER_RESOURCES; // PIPE or DISK
             ctx.w.u8_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved
-            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // ShareFlags
+            // SMB2_SHAREFLAG_NO_CACHING on the pipe share: there is nothing on
+            // it worth a client keeping a copy of.
+            ctx.w.u32_(if (is_ipc) @as(u32, 0x0000_0030) else 0) catch return status.INSUFF_SERVER_RESOURCES; // ShareFlags
             ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Capabilities
             ctx.w.u32_(if (writable) access.full else access.read_only) catch return status.INSUFF_SERVER_RESOURCES;
 
@@ -1714,6 +1727,10 @@ pub fn Server(comptime limits: Limits) type {
 
         fn closeOpen(s: *Self, session: *Session, open: *Open) void {
             _ = session;
+            if (open.is_pipe) {
+                open.active = false;
+                return;
+            }
             s.releaseLocks(open.id);
             s.releaseGrant(open.id);
             s.endWatches(open.id);
@@ -1959,8 +1976,7 @@ pub fn Server(comptime limits: Limits) type {
             const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
 
             const open = findOpen(ctx, raw_id) orelse return status.FILE_CLOSED;
-            const share = s.shares[open.share];
-            const meta = share.stat(open.handle) catch Share.Meta{};
+            const meta = if (open.is_pipe) Share.Meta{} else s.shares[open.share].stat(open.handle) catch Share.Meta{};
             s.closeOpen(ctx.session.?, open);
             if (ctx.chain.has_file and std.mem.readInt(u64, ctx.chain.file_id[0..8], .little) == open.id) {
                 ctx.chain.has_file = false;
@@ -1989,7 +2005,8 @@ pub fn Server(comptime limits: Limits) type {
             const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
 
             const open = findOpen(ctx, raw_id) orelse return status.FILE_CLOSED;
-            s.shares[open.share].flush(open.handle) catch |err| return Share.statusFor(err);
+            // Nothing is buffered for a pipe, so there is nothing to flush.
+            if (!open.is_pipe) s.shares[open.share].flush(open.handle) catch |err| return Share.statusFor(err);
             ctx.w.u16_(4) catch return status.INSUFF_SERVER_RESOURCES;
             ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES;
             return status.SUCCESS;
@@ -2382,6 +2399,183 @@ pub fn Server(comptime limits: Limits) type {
             return status.SUCCESS;
         }
 
+        // ------------------------------------------------------------- pipes
+
+        /// The only pipe there is. A client that asks for another one is told
+        /// it does not exist, which is true and is what it expects to hear.
+        const srvsvc_name = "srvsvc";
+
+        fn handlePipeCreate(s: *Self, ctx: *Ctx) u32 {
+            var r = wire.Reader.init(ctx.body);
+            const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
+            if (structure_size != 57) return status.INVALID_PARAMETER;
+            // Past everything a pipe has no use for, to the name.
+            r.skip(42) catch return status.INVALID_PARAMETER;
+            const name_offset = r.u16_() catch return status.INVALID_PARAMETER;
+            const name_length = r.u16_() catch return status.INVALID_PARAMETER;
+
+            const request = wire.Reader.init(ctx.msg);
+            const raw = request.sliceAt(name_offset, name_length) catch return status.INVALID_PARAMETER;
+            var utf8: [128]u8 = undefined;
+            const wire_name = unicode.toUtf8(&utf8, raw) catch return status.OBJECT_NAME_INVALID;
+            var name = wire_name;
+            while (name.len > 0 and name[0] == '\\') name = name[1..];
+            if (!unicode.eqlIgnoreCase(name, srvsvc_name)) return status.OBJECT_NAME_NOT_FOUND;
+
+            const session = ctx.session.?;
+            const open = s.allocOpen(session) orelse return status.INSUFF_SERVER_RESOURCES;
+            open.tree_id = ctx.tree.?.id;
+            open.share = ipc_share;
+            open.is_pipe = true;
+            open.can_read = true;
+            open.can_write = true;
+            @memcpy(open.path[0..srvsvc_name.len], srvsvc_name);
+            open.path_len = srvsvc_name.len;
+
+            ctx.chain.file_id = @splat(0);
+            std.mem.writeInt(u64, ctx.chain.file_id[0..8], open.id, .little);
+            std.mem.writeInt(u64, ctx.chain.file_id[8..16], open.id, .little);
+            ctx.chain.has_file = true;
+
+            ctx.w.u16_(89) catch return status.INSUFF_SERVER_RESOURCES; // StructureSize
+            ctx.w.u8_(oplock_level.none) catch return status.INSUFF_SERVER_RESOURCES;
+            ctx.w.u8_(0) catch return status.INSUFF_SERVER_RESOURCES; // Flags
+            ctx.w.u32_(1) catch return status.INSUFF_SERVER_RESOURCES; // FILE_OPENED
+            ctx.w.zeroes(32) catch return status.INSUFF_SERVER_RESOURCES; // four timestamps
+            ctx.w.u64_(0) catch return status.INSUFF_SERVER_RESOURCES; // AllocationSize
+            ctx.w.u64_(0) catch return status.INSUFF_SERVER_RESOURCES; // EndOfFile
+            ctx.w.u32_(0x0000_0080) catch return status.INSUFF_SERVER_RESOURCES; // FILE_ATTRIBUTE_NORMAL
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved2
+            writeFileId(ctx.w, open.id) catch return status.INSUFF_SERVER_RESOURCES;
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // CreateContextsOffset
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // CreateContextsLength
+
+            log.debug("connection {d}: opened the {s} pipe", .{ ctx.conn.token, srvsvc_name });
+            return status.SUCCESS;
+        }
+
+        /// A request written to the pipe. Nothing is answered yet: the client
+        /// asks for the answer with a READ of its own.
+        fn handlePipeWrite(s: *Self, ctx: *Ctx) u32 {
+            _ = s;
+            var r = wire.Reader.init(ctx.body);
+            const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
+            if (structure_size != 49) return status.INVALID_PARAMETER;
+            const data_offset = r.u16_() catch return status.INVALID_PARAMETER;
+            const length = r.u32_() catch return status.INVALID_PARAMETER;
+            _ = r.u64_() catch return status.INVALID_PARAMETER; // Offset: a pipe has none
+            const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
+
+            const open = findOpen(ctx, raw_id) orelse return status.FILE_CLOSED;
+            if (!open.is_pipe) return status.INVALID_DEVICE_REQUEST;
+
+            const request = wire.Reader.init(ctx.msg);
+            const data = request.sliceAt(data_offset, length) catch return status.INVALID_PARAMETER;
+            pipe.receive(&open.pipe_state, data);
+
+            ctx.w.u16_(17) catch return status.INSUFF_SERVER_RESOURCES;
+            ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved
+            ctx.w.u32_(length) catch return status.INSUFF_SERVER_RESOURCES; // Count
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Remaining
+            ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES;
+            ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES;
+            ctx.w.u8_(0) catch return status.INSUFF_SERVER_RESOURCES;
+            return status.SUCCESS;
+        }
+
+        fn handlePipeRead(s: *Self, ctx: *Ctx) u32 {
+            var r = wire.Reader.init(ctx.body);
+            const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
+            if (structure_size != 49) return status.INVALID_PARAMETER;
+            _ = r.u8_() catch return status.INVALID_PARAMETER; // Padding
+            _ = r.u8_() catch return status.INVALID_PARAMETER; // Flags
+            const length = r.u32_() catch return status.INVALID_PARAMETER;
+            _ = r.u64_() catch return status.INVALID_PARAMETER; // Offset: a pipe has none
+            const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
+
+            const open = findOpen(ctx, raw_id) orelse return status.FILE_CLOSED;
+            if (!open.is_pipe) return status.INVALID_DEVICE_REQUEST;
+            if (open.pipe_state.reply == .none) return status.PIPE_EMPTY;
+
+            ctx.w.u16_(17) catch return status.INSUFF_SERVER_RESOURCES;
+            const data_offset_at = ctx.w.pos;
+            ctx.w.u8_(0) catch return status.INSUFF_SERVER_RESOURCES; // DataOffset, patched below
+            ctx.w.u8_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved
+            const length_at = ctx.w.pos;
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // DataLength
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // DataRemaining
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved2
+            ctx.w.patch(data_offset_at, &.{@intCast(ctx.rel())}) catch {};
+
+            const wrote = s.writePipeReply(ctx, open, length) catch return status.BUFFER_TOO_SMALL;
+            ctx.w.patchInt(u32, length_at, @intCast(wrote)) catch {};
+            return status.SUCCESS;
+        }
+
+        /// Both ways of asking end here: the answer is marshalled straight
+        /// into the response being written, and the handle forgets it.
+        fn writePipeReply(s: *Self, ctx: *Ctx, open: *Open, budget: u32) error{Refused}!usize {
+            var entries: [limits.max_shares + 1]pipe.Entry = undefined;
+            for (s.shares[0..s.share_count], 0..) |share, index| {
+                entries[index] = .{ .name = share.name };
+            }
+            entries[s.share_count] = .{ .name = ipc_name, .ipc = true };
+
+            const room = @min(@as(usize, budget), ctx.w.space());
+            var area = wire.Writer.init(ctx.w.buf[ctx.w.pos..][0..room]);
+            pipe.respond(&open.pipe_state, &area, entries[0 .. s.share_count + 1]) catch {
+                open.pipe_state.reply = .none;
+                return error.Refused;
+            };
+            open.pipe_state.reply = .none;
+            ctx.w.pos += area.pos;
+            return area.pos;
+        }
+
+        /// FSCTL_PIPE_TRANSCEIVE: the request and its answer in one round
+        /// trip, which is how a client asks when it knows there will be one.
+        fn handlePipeIoctl(s: *Self, ctx: *Ctx) u32 {
+            var r = wire.Reader.init(ctx.body);
+            const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
+            if (structure_size != 57) return status.INVALID_PARAMETER;
+            _ = r.u16_() catch return status.INVALID_PARAMETER; // Reserved
+            const code = r.u32_() catch return status.INVALID_PARAMETER;
+            const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
+            const input_offset = r.u32_() catch return status.INVALID_PARAMETER;
+            const input_count = r.u32_() catch return status.INVALID_PARAMETER;
+            _ = r.u32_() catch return status.INVALID_PARAMETER; // MaxInputResponse
+            _ = r.u32_() catch return status.INVALID_PARAMETER; // OutputOffset
+            _ = r.u32_() catch return status.INVALID_PARAMETER; // OutputCount
+            const max_output = r.u32_() catch return status.INVALID_PARAMETER;
+
+            if (code != fsctl.pipe_transceive) return status.NOT_SUPPORTED;
+            const open = findOpen(ctx, raw_id) orelse return status.FILE_CLOSED;
+            if (!open.is_pipe) return status.INVALID_DEVICE_REQUEST;
+
+            const request = wire.Reader.init(ctx.msg);
+            const input = request.sliceAt(input_offset, input_count) catch return status.INVALID_PARAMETER;
+            pipe.receive(&open.pipe_state, input);
+            if (open.pipe_state.reply == .none) return status.INVALID_PARAMETER;
+
+            ctx.w.u16_(49) catch return status.INSUFF_SERVER_RESOURCES; // StructureSize
+            ctx.w.u16_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved
+            ctx.w.u32_(code) catch return status.INSUFF_SERVER_RESOURCES;
+            writeFileId(ctx.w, open.id) catch return status.INSUFF_SERVER_RESOURCES;
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // InputOffset
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // InputCount
+            const output_at = ctx.w.pos;
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // OutputOffset
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // OutputCount
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Flags
+            ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // Reserved2
+
+            const buffer_at = ctx.rel();
+            const wrote = s.writePipeReply(ctx, open, max_output) catch return status.BUFFER_TOO_SMALL;
+            ctx.w.patchInt(u32, output_at, buffer_at) catch {};
+            ctx.w.patchInt(u32, output_at + 4, @intCast(wrote)) catch {};
+            return status.SUCCESS;
+        }
+
         // ------------------------------------------------------------ small
 
         fn writeEcho(ctx: *Ctx) u32 {
@@ -2693,6 +2887,7 @@ pub fn Server(comptime limits: Limits) type {
             const request_resume_key: u32 = 0x0014_0078;
             const copychunk: u32 = 0x0014_40F2;
             const copychunk_write: u32 = 0x0014_80F2;
+            const pipe_transceive: u32 = 0x0011_C017;
         };
 
         /// What one server-side copy may ask for. These are the numbers Windows

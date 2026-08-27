@@ -23,6 +23,7 @@ pub const log = @import("log.zig");
 pub const random = @import("random.zig");
 pub const server = @import("server/Server.zig");
 pub const loopback = @import("server/LoopbackClient.zig");
+pub const pipe = @import("server/pipe.zig");
 pub const LoopbackClient = loopback.LoopbackClient;
 pub const Server = server.Server;
 
@@ -51,6 +52,7 @@ test {
     _ = random;
     _ = server;
     _ = loopback;
+    _ = pipe;
     _ = @import("server/protocol_test.zig");
     _ = @import("server/fuzz_test.zig");
     _ = sys;

@@ -40,6 +40,24 @@ smbclient //127.0.0.1/files -U alice%wrongpass -p 4446 -m SMB2 -c 'ls' 2>&1 \
     | grep -q NT_STATUS_LOGON_FAILURE && echo "  ok    smbclient wrong password refused"
 
 echo
+echo "=== browsing for shares ==="
+# The share list is not a file operation: it is an RPC call over a named pipe
+# on IPC$. A client that cannot make it can still mount a share by name, but
+# nobody can find out what the names are.
+/easysambad --port 4451 --bind 127.0.0.1 \
+    --share files=/tmp/smbshare --share-ro archive=/tmp/smbshare \
+    --user alice:hunter2 --log warn &
+sleep 1
+smbclient -L //127.0.0.1 -U alice%hunter2 -p 4451 -m SMB2 2>&1 | sed 's/^/  /' > /tmp/shares.txt
+cat /tmp/shares.txt
+grep -q "files" /tmp/shares.txt && grep -q "archive" /tmp/shares.txt \
+    && echo "  ok    both shares are listed" \
+    || echo "  FAIL  the share list is missing something"
+grep -q 'IPC[$] *IPC' /tmp/shares.txt \
+    && echo "  ok    the pipe share is listed as one" \
+    || echo "  FAIL  IPC[$] is not in the list"
+
+echo
 echo "=== byte-range locks ==="
 # The kernel cifs client sends these for real; macOS answers advisory locks
 # itself with ENOTSUP and never puts them on the wire, so this is the only
