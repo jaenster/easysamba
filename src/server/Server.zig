@@ -1097,7 +1097,7 @@ pub fn Server(comptime limits: Limits) type {
             if (more_to_come) w.patchInt(u32, start + 20, @intCast(w.pos - start)) catch {};
 
             log.debug("connection {d}: {s} -> 0x{x:0>8} ({d} bytes)", .{
-                c.token, @tagName(head.command), code, w.pos - start,
+                c.token, hdr.commandName(head.command), code, w.pos - start,
             });
             s.signResponse(&ctx, w.buf[start..w.pos]);
 
@@ -1162,11 +1162,11 @@ pub fn Server(comptime limits: Limits) type {
             // signed, and required to be signed if the session says so.
             if (ctx.head.isSigned()) {
                 if (!signing.verify(signing.algorithmFor(ctx.conn.dialect), session.session_key, ctx.msg)) {
-                    log.warn("connection {d}: bad signature on {s}", .{ ctx.conn.token, @tagName(command) });
+                    log.warn("connection {d}: bad signature on {s}", .{ ctx.conn.token, hdr.commandName(command) });
                     return status.ACCESS_DENIED;
                 }
             } else if (session.sign_required and command != .session_setup) {
-                log.warn("connection {d}: unsigned {s} on a signed session", .{ ctx.conn.token, @tagName(command) });
+                log.warn("connection {d}: unsigned {s} on a signed session", .{ ctx.conn.token, hdr.commandName(command) });
                 return status.ACCESS_DENIED;
             }
 

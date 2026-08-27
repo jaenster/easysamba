@@ -52,6 +52,7 @@ test {
     _ = server;
     _ = loopback;
     _ = @import("server/protocol_test.zig");
+    _ = @import("server/fuzz_test.zig");
     _ = sys;
     _ = Share;
     _ = posixfs;

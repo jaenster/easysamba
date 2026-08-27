@@ -30,7 +30,17 @@ pub fn build(b: *std.Build) void {
         "Drop debug info from the binary (default: on for release builds)",
     ) orelse (optimize != .Debug);
 
+    // The fuzz tests run a fixed number of rounds so a plain `zig build test`
+    // stays quick. Raising it is how the same tests become something worth
+    // leaving running.
+    const fuzz_rounds = b.option(
+        u32,
+        "fuzz-rounds",
+        "Rounds per fuzz test (default 20000)",
+    ) orelse 20_000;
+
     const build_options = b.addOptions();
+    build_options.addOption(u32, "fuzz_rounds", fuzz_rounds);
     build_options.addOption(bool, "force_poll", force_poll);
     build_options.addOption(u32, "max_io_kib", max_io_kib);
     build_options.addOption(u32, "max_connections", max_connections);

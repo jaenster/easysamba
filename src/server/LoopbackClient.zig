@@ -33,6 +33,8 @@ pub fn LoopbackClient(comptime ServerType: type) type {
         file_id: [16]u8 = @splat(0),
         /// Set once a session key is known and the client is signing.
         sign_key: ?[16]u8 = null,
+        /// How much of `scratch` the last request filled.
+        last_request_len: usize = 0,
 
         const Self = @This();
 
@@ -61,9 +63,16 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             const message = w.written();
             if (c.sign_key) |key| signing.sign(.hmac_sha256, key, message);
 
+            c.last_request_len = message.len;
             c.conn.out_len = 0;
             c.server.handleFrame(c.conn, message);
             return firstFrame(c.conn.out[0..c.conn.out_len]);
+        }
+
+        /// The bytes of the last request this client sent, for a test that
+        /// wants to send them again with something changed.
+        pub fn lastRequest(c: *const Self) []const u8 {
+            return c.scratch[0..c.last_request_len];
         }
 
         /// Writes one complete transport-framed request into `out` and returns

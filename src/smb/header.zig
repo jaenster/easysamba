@@ -39,6 +39,14 @@ pub const Command = enum(u16) {
     _,
 };
 
+/// The name of a command, for logs. A client may send a command number that
+/// does not exist, and asking a non-exhaustive enum for the name of a value it
+/// does not have is a panic — one wrong byte would be enough to stop the
+/// server for everyone.
+pub fn commandName(command: Command) []const u8 {
+    return std.enums.tagName(Command, command) orelse "unknown";
+}
+
 pub const flags = struct {
     pub const SERVER_TO_REDIR: u32 = 0x0000_0001;
     pub const ASYNC_COMMAND: u32 = 0x0000_0002;
