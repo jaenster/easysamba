@@ -26,6 +26,9 @@ pub fn MemFs(comptime opts: Options) type {
         /// Handed out as file_id so a client's cache keys stay unique even
         /// after a node index is recycled.
         next_id: u64 = 1,
+        /// How many times a flush has been asked for. Nothing here needs one;
+        /// it is how a test sees that one happened.
+        flushes: usize = 0,
 
         const Self = @This();
 
@@ -50,6 +53,7 @@ pub fn MemFs(comptime opts: Options) type {
         pub fn init(s: *Self) void {
             for (&s.nodes) |*n| n.used = false;
             s.next_id = 1;
+            s.flushes = 0;
         }
 
         pub fn share(s: *Self, name: []const u8) Share {
@@ -263,8 +267,11 @@ pub fn MemFs(comptime opts: Options) type {
         }
 
         fn vFlush(ctx: *anyopaque, handle: Share.Handle) Share.Error!void {
-            _ = ctx;
             _ = handle;
+            // Nothing here outlives the process, so there is nothing to push
+            // anywhere. The count is for tests that need to know a flush
+            // happened at all.
+            self(ctx).flushes += 1;
         }
 
         fn vReadDir(ctx: *anyopaque, handle: Share.Handle, cursor: *Share.Cursor, name_buf: []u8, out: *Share.DirEntry) Share.Error!bool {

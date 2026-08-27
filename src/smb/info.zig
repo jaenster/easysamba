@@ -155,6 +155,12 @@ pub const HandleState = struct {
     /// The share-relative path in Windows form.
     name: []const u8 = "",
     delete_pending: bool = false,
+    /// Where the client last put the handle. Nothing here reads or writes at
+    /// it — every SMB2 read and write carries its own offset — but a client
+    /// that sets it expects to find it again.
+    position: u64 = 0,
+    /// FileModeInformation, kept as the client set it.
+    mode: u32 = 0,
     /// What this handle was actually granted, which is not always everything.
     access: u32 = full_access,
 };
@@ -173,8 +179,8 @@ pub fn writeFileInfo(
         .internal => try w.u64_(meta.file_id),
         .ea => try w.u32_(0),
         .access => try w.u32_(state.access),
-        .position => try w.u64_(0),
-        .mode => try w.u32_(0),
+        .position => try w.u64_(state.position),
+        .mode => try w.u32_(state.mode),
         .alignment => try w.u32_(0), // FILE_BYTE_ALIGNMENT
         .name => {
             const len = try unicode.utf16leLen(name);
@@ -211,8 +217,8 @@ pub fn writeFileInfo(
             try w.u64_(meta.file_id); // Internal
             try w.u32_(0); // Ea
             try w.u32_(state.access); // Access
-            try w.u64_(0); // Position
-            try w.u32_(0); // Mode
+            try w.u64_(state.position); // Position
+            try w.u32_(state.mode); // Mode
             try w.u32_(0); // Alignment
             const len = try unicode.utf16leLen(name);
             try w.u32_(@intCast(len));
@@ -221,6 +227,9 @@ pub fn writeFileInfo(
         else => return error.BadEncoding,
     }
 }
+
+/// What a quota field says when there is no quota.
+const no_quota: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 /// Everything a handle can be granted.
 pub const full_access: u32 = 0x001F_01FF; // FILE_ALL_ACCESS
@@ -272,6 +281,17 @@ pub fn writeFsInfo(w: *wire.Writer, class: FsClass, info: Share.FsInfo) Error!vo
             try w.u64_(free_units); // actually available
             try w.u32_(@intCast(unit / 512));
             try w.u32_(512);
+        },
+        .control => {
+            // Quotas are not tracked, and saying so is the answer: no
+            // threshold, no limit, no filtering.
+            try w.u64_(0); // FreeSpaceStartFiltering
+            try w.u64_(0); // FreeSpaceThreshold
+            try w.u64_(0); // FreeSpaceStopFiltering
+            try w.u64_(no_quota); // DefaultQuotaThreshold
+            try w.u64_(no_quota); // DefaultQuotaLimit
+            try w.u32_(0); // FileSystemControlFlags
+            try w.u32_(0); // Padding
         },
         .device => {
             try w.u32_(device_type_disk);
@@ -388,6 +408,16 @@ pub fn parseDisposition(buf: []const u8) Error!bool {
 pub fn parseEndOfFile(buf: []const u8) Error!u64 {
     var r = wire.Reader.init(buf);
     return r.u64_();
+}
+
+pub fn parsePosition(buf: []const u8) Error!u64 {
+    var r = wire.Reader.init(buf);
+    return r.u64_();
+}
+
+pub fn parseMode(buf: []const u8) Error!u32 {
+    var r = wire.Reader.init(buf);
+    return r.u32_();
 }
 
 /// FileBasicInformation as a SET_INFO: a zero timestamp means "leave it", and

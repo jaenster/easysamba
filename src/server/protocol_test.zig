@@ -446,6 +446,34 @@ test "set info: truncate, rename, and delete on close" {
     try testing.expectEqual(status.OBJECT_NAME_NOT_FOUND, c.client.open(.{ .path = "renamed.txt" }));
 }
 
+test "a handle remembers the position and the mode a client set on it" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+
+    var position: [8]u8 = undefined;
+    std.mem.writeInt(u64, &position, 4096, .little);
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.setInfo(.position, &position)));
+
+    var mode: [4]u8 = undefined;
+    std.mem.writeInt(u32, &mode, 0x0000_0010, .little); // FILE_SYNCHRONOUS_IO_NONALERT
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.setInfo(.mode, &mode)));
+
+    const read_back = c.client.queryInfo(.file, @intFromEnum(info.FileClass.position));
+    const at = std.mem.readInt(u16, bodyOf(read_back)[2..4], .little);
+    try testing.expectEqual(@as(u64, 4096), std.mem.readInt(u64, read_back[at..][0..8], .little));
+
+    const mode_back = c.client.queryInfo(.file, @intFromEnum(info.FileClass.mode));
+    const mode_at = std.mem.readInt(u16, bodyOf(mode_back)[2..4], .little);
+    try testing.expectEqual(@as(u32, 0x0000_0010), std.mem.readInt(u32, mode_back[mode_at..][0..4], .little));
+
+    // And it belongs to the handle, not to the file.
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt" }));
+    const fresh = c.client.queryInfo(.file, @intFromEnum(info.FileClass.position));
+    const fresh_at = std.mem.readInt(u16, bodyOf(fresh)[2..4], .little);
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, fresh[fresh_at..][0..8], .little));
+}
+
 test "a handle is told what it was granted, not what everything would be" {
     const c = try setup(.{}, "alice:" ++ password ++ "\nbob:" ++ password ++ ":ro");
     defer c.destroy(testing.allocator);
@@ -459,6 +487,79 @@ test "a handle is told what it was granted, not what everything would be" {
     const mask = std.mem.readInt(u32, granted[at..][0..4], .little);
     try testing.expect(mask & 0x0000_0001 != 0); // FILE_READ_DATA
     try testing.expect(mask & 0x0000_0002 == 0); // FILE_WRITE_DATA
+}
+
+test "the filesystem control record is answered" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt" }));
+
+    const control = c.client.queryInfo(.filesystem, @intFromEnum(info.FsClass.control));
+    try testing.expectEqual(status.SUCCESS, statusOf(control));
+    try testing.expectEqual(@as(u32, 48), std.mem.readInt(u32, bodyOf(control)[4..8], .little));
+}
+
+test "setting permissions is refused rather than accepted and dropped" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+
+    const descriptor: [20]u8 = @splat(0);
+    try testing.expectEqual(
+        status.NOT_SUPPORTED,
+        statusOf(c.client.setInfoTyped(.security, 0, &descriptor)),
+    );
+}
+
+test "a write is not called durable until it is" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+
+    // An ordinary write is answered as soon as the adapter has it.
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFile(0, "one")));
+    try testing.expectEqual(@as(usize, 0), c.fs.flushes);
+
+    // SMB2_WRITEFLAG_WRITE_THROUGH: the client is asking for durability, and
+    // an answer before the flush would be a promise nothing kept.
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.writeFileWithFlags(0, "two", 0x0000_0001)));
+    try testing.expectEqual(@as(usize, 1), c.fs.flushes);
+}
+
+test "a handle opened for write-through flushes every write" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_write,
+        .options = 0x0000_0002, // FILE_WRITE_THROUGH
+    }));
+
+    _ = c.client.writeFile(0, "one");
+    _ = c.client.writeFile(3, "two");
+    try testing.expectEqual(@as(usize, 2), c.fs.flushes);
+}
+
+test "reserving room for a file does not change its size" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt", .access_mask = read_write }));
+
+    // What a client does before copying something large into a file.
+    var size: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size, 4096, .little);
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.setInfo(.allocation, &size)));
+
+    const standard = c.client.queryInfo(.file, @intFromEnum(info.FileClass.standard));
+    const at = std.mem.readInt(u16, bodyOf(standard)[2..4], .little);
+    try testing.expectEqual(@as(u64, 9), std.mem.readInt(u64, standard[at + 8 ..][0..8], .little));
+
+    // Asking for less than there already is still cuts the file down.
+    std.mem.writeInt(u64, &size, 4, .little);
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.setInfo(.allocation, &size)));
+    const after = c.client.queryInfo(.file, @intFromEnum(info.FileClass.standard));
+    const after_at = std.mem.readInt(u16, bodyOf(after)[2..4], .little);
+    try testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, after[after_at + 8 ..][0..8], .little));
 }
 
 test "the permissions a client is shown are the ones it actually has" {

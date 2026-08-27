@@ -366,6 +366,10 @@ pub fn LoopbackClient(comptime ServerType: type) type {
         }
 
         pub fn writeFile(c: *Self, offset: u64, data: []const u8) []const u8 {
+            return c.writeFileWithFlags(offset, data, 0);
+        }
+
+        pub fn writeFileWithFlags(c: *Self, offset: u64, data: []const u8, flags: u32) []const u8 {
             // Built at the far end of the scratch buffer, since `send` builds
             // the message at the near end.
             var w = wire.Writer.init(c.scratch[c.scratch.len / 2 ..]);
@@ -378,7 +382,7 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             w.u32_(0) catch unreachable; // RemainingBytes
             w.u16_(0) catch unreachable;
             w.u16_(0) catch unreachable;
-            w.u32_(0) catch unreachable; // Flags
+            w.u32_(flags) catch unreachable;
             w.blob(data) catch unreachable;
             return c.send(.write, w.written());
         }
@@ -439,11 +443,15 @@ pub fn LoopbackClient(comptime ServerType: type) type {
         }
 
         pub fn setInfo(c: *Self, class: info.FileClass, payload: []const u8) []const u8 {
+            return c.setInfoTyped(.file, @intFromEnum(class), payload);
+        }
+
+        pub fn setInfoTyped(c: *Self, info_type: info.InfoType, class: u8, payload: []const u8) []const u8 {
             var body: [1024]u8 = undefined;
             var w = wire.Writer.init(&body);
             w.u16_(33) catch unreachable;
-            w.u8_(@intFromEnum(info.InfoType.file)) catch unreachable;
-            w.u8_(@intFromEnum(class)) catch unreachable;
+            w.u8_(@intFromEnum(info_type)) catch unreachable;
+            w.u8_(class) catch unreachable;
             w.u32_(@intCast(payload.len)) catch unreachable;
             w.u16_(64 + 32) catch unreachable; // BufferOffset
             w.u16_(0) catch unreachable; // Reserved

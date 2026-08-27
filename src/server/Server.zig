@@ -166,9 +166,14 @@ const share_access = struct {
 
 const create_options = struct {
     const DIRECTORY_FILE: u32 = 0x0000_0001;
+    const WRITE_THROUGH: u32 = 0x0000_0002;
     const NON_DIRECTORY_FILE: u32 = 0x0000_0040;
     const DELETE_ON_CLOSE: u32 = 0x0000_1000;
 };
+
+/// SMB2_WRITEFLAG_WRITE_THROUGH: do not answer until the bytes are somewhere
+/// that survives losing power.
+const write_flag_through: u32 = 0x0000_0001;
 
 const query_dir_flags = struct {
     const RESTART_SCANS: u8 = 0x01;
@@ -278,6 +283,9 @@ pub fn Server(comptime limits: Limits) type {
             can_read: bool = false,
             can_write: bool = false,
             delete_on_close: bool = false,
+            /// The handle was opened for writing that has to be durable, so
+            /// every write on it is followed through to the adapter.
+            write_through: bool = false,
             /// What this handle was opened for, and what it is prepared to let
             /// another handle do at the same time. Both halves are kept
             /// because a sharing decision needs each side of it: what the
@@ -289,6 +297,10 @@ pub fn Server(comptime limits: Limits) type {
             /// asks. A read-only account holding a handle it may only read
             /// from is entitled to know that before it tries to write.
             granted_access: u32 = 0,
+            /// Set by the client, handed back to the client, used by neither:
+            /// every read and write over SMB2 carries its own offset.
+            position: u64 = 0,
+            mode: u32 = 0,
 
             // Directory enumeration state. A client walks a directory across
             // several QUERY_DIRECTORY requests on one handle, so the position
@@ -1831,6 +1843,7 @@ pub fn Server(comptime limits: Limits) type {
             open.can_read = access.wantsRead(desired_access) or !wants_write;
             open.can_write = wants_write;
             open.delete_on_close = options & create_options.DELETE_ON_CLOSE != 0;
+            open.write_through = options & create_options.WRITE_THROUGH != 0;
             @memcpy(open.path[0..path.len], path);
             open.path_len = path.len;
             open.path_hash = path_hash;
@@ -2002,6 +2015,8 @@ pub fn Server(comptime limits: Limits) type {
             const length = r.u32_() catch return status.INVALID_PARAMETER;
             const offset = r.u64_() catch return status.INVALID_PARAMETER;
             const raw_id = r.take(16) catch return status.INVALID_PARAMETER;
+            r.skip(12) catch return status.INVALID_PARAMETER; // channel and its buffer
+            const flags = r.u32_() catch return status.INVALID_PARAMETER;
 
             const open = findOpen(ctx, raw_id) orelse return status.FILE_CLOSED;
             if (open.is_dir) return status.INVALID_DEVICE_REQUEST;
@@ -2011,7 +2026,14 @@ pub fn Server(comptime limits: Limits) type {
 
             const request = wire.Reader.init(ctx.msg);
             const data = request.sliceAt(data_offset, length) catch return status.INVALID_PARAMETER;
-            const wrote = s.shares[open.share].write(open.handle, offset, data) catch |err| return Share.statusFor(err);
+            const share = s.shares[open.share];
+            const wrote = share.write(open.handle, offset, data) catch |err| return Share.statusFor(err);
+            // A client that asked for the write to be durable is not told it
+            // succeeded until it is. Answering first and flushing later would
+            // be the useful lie this whole server is written to avoid.
+            if (open.write_through or flags & write_flag_through != 0) {
+                share.flush(open.handle) catch |err| return Share.statusFor(err);
+            }
             s.breakGrants(open);
             s.noteOpenChange(open, notify_action.modified, notify_filter.last_write | notify_filter.size);
 
@@ -2181,6 +2203,8 @@ pub fn Server(comptime limits: Limits) type {
                     info.writeFileInfo(&area, @enumFromInt(class), meta, .{
                         .name = name,
                         .delete_pending = open.delete_on_close,
+                        .position = open.position,
+                        .mode = open.mode,
                         .access = open.granted_access,
                     }) catch |err| {
                         return switch (err) {
@@ -2242,7 +2266,14 @@ pub fn Server(comptime limits: Limits) type {
             const buffer_length = r.u32_() catch return status.INVALID_PARAMETER;
             const buffer_offset = r.u16_() catch return status.INVALID_PARAMETER;
 
-            if (info_type != .file) return status.INVALID_INFO_CLASS;
+            switch (info_type) {
+                .file => {},
+                // Setting an owner, an ACL or a quota is refused rather than
+                // accepted and dropped: a client told its permissions were
+                // applied would go on as though they had been.
+                .security, .quota => return status.NOT_SUPPORTED,
+                else => return status.INVALID_INFO_CLASS,
+            }
             const request = wire.Reader.init(ctx.msg);
             const buffer = request.sliceAt(buffer_offset, buffer_length) catch return status.INVALID_PARAMETER;
 
@@ -2268,13 +2299,29 @@ pub fn Server(comptime limits: Limits) type {
                     if (delete and share.read_only) return status.ACCESS_DENIED;
                     open.delete_on_close = delete;
                 },
-                .end_of_file, .allocation => {
+                .end_of_file => {
                     if (!open.can_write) return status.ACCESS_DENIED;
                     const size = info.parseEndOfFile(buffer) catch return status.INFO_LENGTH_MISMATCH;
                     share.truncate(open.handle, size) catch |err| return Share.statusFor(err);
                     s.breakGrants(open);
                     s.noteOpenChange(open, notify_action.modified, notify_filter.size);
                 },
+                .allocation => {
+                    // Room asked for in advance, which a client does before
+                    // copying a large file. Reserving it is not a change to
+                    // the file's size, and only asking for less than there
+                    // already is means anything here.
+                    if (!open.can_write) return status.ACCESS_DENIED;
+                    const size = info.parseEndOfFile(buffer) catch return status.INFO_LENGTH_MISMATCH;
+                    const meta = share.stat(open.handle) catch |err| return Share.statusFor(err);
+                    if (size < meta.size) {
+                        share.truncate(open.handle, size) catch |err| return Share.statusFor(err);
+                        s.breakGrants(open);
+                        s.noteOpenChange(open, notify_action.modified, notify_filter.size);
+                    }
+                },
+                .position => open.position = info.parsePosition(buffer) catch return status.INFO_LENGTH_MISMATCH,
+                .mode => open.mode = info.parseMode(buffer) catch return status.INFO_LENGTH_MISMATCH,
                 .rename => {
                     const rename = info.parseRename(buffer) catch return status.INFO_LENGTH_MISMATCH;
                     var utf8: [unicode.max_path]u8 = undefined;
