@@ -131,6 +131,17 @@ const access = struct {
         return mask & (DELETE | DELETE_CHILD | GENERIC_ALL) != 0;
     }
 
+    /// A client may ask for access in generic terms; what it is granted, and
+    /// what it is told it was granted, is always specific.
+    fn expand(mask: u32) u32 {
+        var out = mask & full;
+        if (mask & GENERIC_ALL != 0) out |= full;
+        if (mask & GENERIC_READ != 0) out |= read_only;
+        if (mask & GENERIC_WRITE != 0) out |= WRITE_DATA | APPEND_DATA | WRITE_EA | WRITE_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+        if (mask & GENERIC_EXECUTE != 0) out |= EXECUTE | READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+        return out;
+    }
+
     // Sharing is decided on a narrower question than access is. Reading a
     // file's timestamps is a read, but it is not the kind of read another
     // handle means to keep out when it opens a file for exclusive use — MS-FSA
@@ -274,6 +285,10 @@ pub fn Server(comptime limits: Limits) type {
             /// what they already have against what the newcomer permits.
             desired_access: u32 = 0,
             share_access: u32 = 0,
+            /// What the handle was granted, which is what it is told when it
+            /// asks. A read-only account holding a handle it may only read
+            /// from is entitled to know that before it tries to write.
+            granted_access: u32 = 0,
 
             // Directory enumeration state. A client walks a directory across
             // several QUERY_DIRECTORY requests on one handle, so the position
@@ -1788,6 +1803,7 @@ pub fn Server(comptime limits: Limits) type {
             if (options & create_options.DIRECTORY_FILE != 0) directory = true;
             if (options & create_options.NON_DIRECTORY_FILE != 0) directory = false;
 
+            const asked = parseCreateContexts(ctx.msg, contexts_offset, contexts_length);
             const path_hash = std.hash.Wyhash.hash(0, path);
             const wanted = desired_access | (if (wants_delete) access.DELETE else 0);
             const conflict = s.openConflict(ctx.tree.?.share, path_hash, path, wanted, sharing);
@@ -1820,13 +1836,9 @@ pub fn Server(comptime limits: Limits) type {
             open.path_hash = path_hash;
             open.desired_access = wanted;
             open.share_access = sharing;
+            open.granted_access = access.expand(desired_access) & maximalAccess(session, share);
 
-            const granted = s.grantCaching(
-                ctx,
-                open,
-                requested_oplock,
-                findLeaseContext(ctx.msg, contexts_offset, contexts_length),
-            );
+            const granted = s.grantCaching(ctx, open, requested_oplock, asked.lease);
             // Opening a file in a way that throws its contents away is a change
             // to it, so whoever was caching those contents has to hear about it.
             if (opened.action == .superseded or opened.action == .overwritten) {
@@ -1862,31 +1874,34 @@ pub fn Server(comptime limits: Limits) type {
             ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // CreateContextsOffset
             ctx.w.u32_(0) catch return status.INSUFF_SERVER_RESOURCES; // CreateContextsLength
 
+            var chain = ContextChain{ .ctx = ctx };
             if (granted == oplock_level.lease) {
-                const at = ctx.rel();
-                writeLeaseContext(ctx.w, open.lease_key) catch return status.INSUFF_SERVER_RESOURCES;
-                ctx.w.patchInt(u32, contexts_at, at) catch {};
-                ctx.w.patchInt(u32, contexts_at + 4, @intCast(ctx.rel() - at)) catch {};
+                writeLeaseContext(&chain, open.lease_key) catch return status.INSUFF_SERVER_RESOURCES;
             }
+            if (asked.maximal_access) {
+                writeMaximalAccess(&chain, maximalAccess(session, share)) catch return status.INSUFF_SERVER_RESOURCES;
+            }
+            if (asked.disk_id) {
+                writeDiskId(&chain, meta.file_id, s.volumeId(open.share)) catch return status.INSUFF_SERVER_RESOURCES;
+            }
+            chain.finish(contexts_at);
             return status.SUCCESS;
         }
 
-        /// The granted lease, echoed back in the shape it arrived in. The key
-        /// is the client's own; the state is what it actually got, which is
-        /// read caching and nothing else.
-        fn writeLeaseContext(w: *wire.Writer, key: [16]u8) wire.Error!void {
-            try w.u32_(0); // Next: the only context in the answer
-            try w.u16_(create_context_header); // NameOffset
-            try w.u16_(lease_context_name.len); // NameLength
-            try w.u16_(0); // Reserved
-            try w.u16_(create_context_header + 8); // DataOffset, past the padded name
-            try w.u32_(lease_data_size); // DataLength
-            try w.blob(lease_context_name);
-            try w.zeroes(4); // padding to the 8-aligned data
-            try w.blob(&key);
-            try w.u32_(lease_state.read_caching);
-            try w.u32_(0); // LeaseFlags
-            try w.u64_(0); // LeaseDuration
+        /// Everything an account is allowed to do with a file on this share.
+        /// There are no per-file permissions here: what a client may do is
+        /// decided by the share it came in through and the account it came in
+        /// as, so the answer is the same for every file on it.
+        fn maximalAccess(session: *const Session, share: Share) u32 {
+            if (session.account.read_only or share.read_only) return access.read_only;
+            return access.full;
+        }
+
+        /// A volume number for the share, made once at startup. It exists so a
+        /// client can tell two files on different shares apart when their
+        /// adapters happen to number them the same way.
+        fn volumeId(s: *const Self, share_index: usize) u64 {
+            return std.hash.Wyhash.hash(std.mem.readInt(u64, s.resume_salt[0..8], .little), s.shares[share_index].name);
         }
 
         fn handleClose(s: *Self, ctx: *Ctx) u32 {
@@ -2163,7 +2178,11 @@ pub fn Server(comptime limits: Limits) type {
                     const meta = share.stat(open.handle) catch |err| return Share.statusFor(err);
                     var name_buf: [limits.path_bytes + 1]u8 = undefined;
                     const name = wireName(&name_buf, open.path_());
-                    info.writeFileInfo(&area, @enumFromInt(class), meta, name, open.delete_on_close) catch |err| {
+                    info.writeFileInfo(&area, @enumFromInt(class), meta, .{
+                        .name = name,
+                        .delete_pending = open.delete_on_close,
+                        .access = open.granted_access,
+                    }) catch |err| {
                         return switch (err) {
                             error.NoSpace => status.INFO_LENGTH_MISMATCH,
                             error.BadEncoding => status.INVALID_INFO_CLASS,
@@ -2182,7 +2201,11 @@ pub fn Server(comptime limits: Limits) type {
                     };
                 },
                 .security => {
-                    info.writeSecurityDescriptor(&area, additional) catch {
+                    // There are no per-file permissions here; what anyone may
+                    // do is decided by the share and the account. Saying so
+                    // is more use to a client than a descriptor that claims
+                    // everyone may do everything.
+                    info.writeSecurityDescriptor(&area, additional, maximalAccess(ctx.session.?, share)) catch {
                         return status.BUFFER_TOO_SMALL;
                     };
                 },
@@ -2309,20 +2332,38 @@ pub fn Server(comptime limits: Limits) type {
             state: u32,
         };
 
-        const lease_context_name = "RqLs";
+        /// The four-letter names of the create contexts this server answers
+        /// for. Everything else a client sends is read past.
+        const context_name = struct {
+            const lease = "RqLs";
+            const maximal_access = "MxAc";
+            const disk_id = "QFid";
+        };
         /// Next, NameOffset, NameLength, Reserved, DataOffset, DataLength.
         const create_context_header = 16;
         /// A version 1 lease: key, state, flags, duration.
         const lease_data_size = 32;
 
-        /// Finds the lease a CREATE asked for among its create contexts. Every
-        /// other context — durable handles, allocation hints, the security
-        /// descriptor — is skipped rather than refused: a client sends what it
-        /// has and expects a server to answer for the parts it understands.
-        fn findLeaseContext(msg: []const u8, offset: u32, length: u32) ?LeaseRequest {
-            if (length < create_context_header) return null;
+        /// What a CREATE asked for beyond the file itself.
+        const CreateContexts = struct {
+            lease: ?LeaseRequest = null,
+            /// "MxAc": tell me everything I would be allowed to do with this
+            /// file, so I do not have to open it again to find out.
+            maximal_access: bool = false,
+            /// "QFid": tell me what this file is, so I can recognise it under
+            /// another name.
+            disk_id: bool = false,
+        };
+
+        /// Reads the create contexts a CREATE carries. Anything not understood
+        /// — durable handles, allocation hints, a security descriptor — is
+        /// skipped rather than refused: a client sends what it has and expects
+        /// a server to answer for the parts it knows.
+        fn parseCreateContexts(msg: []const u8, offset: u32, length: u32) CreateContexts {
+            var found = CreateContexts{};
+            if (length < create_context_header) return found;
             const request = wire.Reader.init(msg);
-            const blob = request.sliceAt(offset, length) catch return null;
+            const blob = request.sliceAt(offset, length) catch return found;
 
             var at: usize = 0;
             while (at + create_context_header <= blob.len) {
@@ -2333,24 +2374,102 @@ pub fn Server(comptime limits: Limits) type {
                 const data_offset = std.mem.readInt(u16, chunk[10..12], .little);
                 const data_length = std.mem.readInt(u32, chunk[12..16], .little);
 
-                const named = @as(usize, name_offset) + name_length <= chunk.len and
-                    name_length == lease_context_name.len and
-                    std.mem.eql(u8, chunk[name_offset..][0..lease_context_name.len], lease_context_name);
-                if (named) {
-                    if (@as(usize, data_offset) + data_length > chunk.len) return null;
-                    if (data_length < lease_data_size) return null;
-                    const data = chunk[data_offset..];
-                    return .{
-                        .key = data[0..16].*,
-                        .state = std.mem.readInt(u32, data[16..20], .little),
-                    };
+                if (@as(usize, name_offset) + name_length <= chunk.len and name_length == 4) {
+                    const name = chunk[name_offset..][0..4];
+                    if (std.mem.eql(u8, name, context_name.lease)) {
+                        if (@as(usize, data_offset) + data_length <= chunk.len and data_length >= lease_data_size) {
+                            const data = chunk[data_offset..];
+                            found.lease = .{
+                                .key = data[0..16].*,
+                                .state = std.mem.readInt(u32, data[16..20], .little),
+                            };
+                        }
+                    } else if (std.mem.eql(u8, name, context_name.maximal_access)) {
+                        found.maximal_access = true;
+                    } else if (std.mem.eql(u8, name, context_name.disk_id)) {
+                        found.disk_id = true;
+                    }
                 }
                 // A Next that does not move past the header it just described
                 // would be a loop, and a chain of contexts always ends in zero.
                 if (next < create_context_header) break;
                 at += next;
             }
-            return null;
+            return found;
+        }
+
+        /// The contexts a CREATE response carries, chained the way a client
+        /// reads them: each one says how far away the next is, and the last
+        /// one says zero.
+        const ContextChain = struct {
+            ctx: *Ctx,
+            first: usize = 0,
+            previous: ?usize = null,
+
+            /// Starts a context 8-aligned from the head of the message, which
+            /// is where a client expects to find one.
+            fn begin(chain: *ContextChain, name: []const u8, data_length: u32) wire.Error!void {
+                const w = chain.ctx.w;
+                while (chain.ctx.rel() % 8 != 0) try w.u8_(0);
+                const at = w.pos;
+                if (chain.previous) |previous| {
+                    try w.patchInt(u32, previous, @intCast(at - previous));
+                } else {
+                    chain.first = at;
+                }
+                chain.previous = at;
+
+                try w.u32_(0); // Next, patched by whatever comes after this
+                try w.u16_(create_context_header); // NameOffset
+                try w.u16_(@intCast(name.len)); // NameLength
+                try w.u16_(0); // Reserved
+                try w.u16_(create_context_header + 8); // DataOffset, past the padded name
+                try w.u32_(data_length);
+                try w.blob(name);
+                try w.zeroes(8 - name.len);
+            }
+
+            /// Fills in where the contexts are, or leaves the answer saying
+            /// there are none.
+            fn finish(chain: *const ContextChain, offset_at: usize) void {
+                if (chain.previous == null) return;
+                const w = chain.ctx.w;
+                w.patchInt(u32, offset_at, @intCast(chain.first - chain.ctx.start)) catch {};
+                w.patchInt(u32, offset_at + 4, @intCast(w.pos - chain.first)) catch {};
+            }
+        };
+
+        /// The lease that was granted, echoed back in the shape it arrived in.
+        /// The key is the client's own; the state is what it actually got,
+        /// which is read caching and nothing else.
+        fn writeLeaseContext(chain: *ContextChain, key: [16]u8) wire.Error!void {
+            try chain.begin(context_name.lease, lease_data_size);
+            const w = chain.ctx.w;
+            try w.blob(&key);
+            try w.u32_(lease_state.read_caching);
+            try w.u32_(0); // LeaseFlags
+            try w.u64_(0); // LeaseDuration
+        }
+
+        /// Everything this client would be allowed to do with the file it just
+        /// opened, whether or not it asked for that much. A client uses it to
+        /// show a file as read-only without opening it a second time to find
+        /// out.
+        fn writeMaximalAccess(chain: *ContextChain, granted_access: u32) wire.Error!void {
+            try chain.begin(context_name.maximal_access, 8);
+            const w = chain.ctx.w;
+            try w.u32_(status.SUCCESS); // QueryStatus
+            try w.u32_(granted_access);
+        }
+
+        /// What the file is, underneath the name it was opened by. A client
+        /// that sees the same id under two names knows they are one file.
+        fn writeDiskId(chain: *ContextChain, file_id: u64, volume: u64) wire.Error!void {
+            try chain.begin(context_name.disk_id, 32);
+            const w = chain.ctx.w;
+            try w.u64_(file_id);
+            try w.u64_(volume);
+            try w.zeroes(16); // Reserved
         }
 
         /// Decides what caching a new handle gets, which is never more than the

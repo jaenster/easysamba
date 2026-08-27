@@ -148,19 +148,31 @@ pub fn writeDirEntry(
 
 // --------------------------------------------------------------- file info
 
+/// What the server knows about an open handle that the file itself does not
+/// say: the name it was opened by, and the few things a client can set on a
+/// handle and expects to read back unchanged.
+pub const HandleState = struct {
+    /// The share-relative path in Windows form.
+    name: []const u8 = "",
+    delete_pending: bool = false,
+    /// What this handle was actually granted, which is not always everything.
+    access: u32 = full_access,
+};
+
 pub fn writeFileInfo(
     w: *wire.Writer,
     class: FileClass,
     meta: Share.Meta,
-    name: []const u8,
-    delete_pending: bool,
+    state: HandleState,
 ) Error!void {
+    const name = state.name;
+    const delete_pending = state.delete_pending;
     switch (class) {
         .basic => try writeBasic(w, meta),
         .standard => try writeStandard(w, meta, delete_pending),
         .internal => try w.u64_(meta.file_id),
         .ea => try w.u32_(0),
-        .access => try w.u32_(access_mask),
+        .access => try w.u32_(state.access),
         .position => try w.u64_(0),
         .mode => try w.u32_(0),
         .alignment => try w.u32_(0), // FILE_BYTE_ALIGNMENT
@@ -198,7 +210,7 @@ pub fn writeFileInfo(
             try writeStandard(w, meta, delete_pending);
             try w.u64_(meta.file_id); // Internal
             try w.u32_(0); // Ea
-            try w.u32_(access_mask); // Access
+            try w.u32_(state.access); // Access
             try w.u64_(0); // Position
             try w.u32_(0); // Mode
             try w.u32_(0); // Alignment
@@ -210,9 +222,8 @@ pub fn writeFileInfo(
     }
 }
 
-/// What we report as the granted access. Handed back verbatim from
-/// FileAccessInformation; clients compare it against what they asked for.
-const access_mask: u32 = 0x001F_01FF; // FILE_ALL_ACCESS
+/// Everything a handle can be granted.
+pub const full_access: u32 = 0x001F_01FF; // FILE_ALL_ACCESS
 
 fn writeBasic(w: *wire.Writer, meta: Share.Meta) Error!void {
     try w.u64_(meta.created);
@@ -301,7 +312,7 @@ pub fn writeFsInfo(w: *wire.Writer, class: FsClass, info: Share.FsInfo) Error!vo
 /// macOS and Windows both ask for a descriptor while copying files and treat a
 /// failure as "you may not read this", so the honest answer ("no ACL model
 /// here") has to be spelled as a permissive descriptor rather than an error.
-pub fn writeSecurityDescriptor(w: *wire.Writer, requested: u32) Error!void {
+pub fn writeSecurityDescriptor(w: *wire.Writer, requested: u32, granted: u32) Error!void {
     const owner_sid = [_]u8{ 1, 2, 0, 0, 0, 0, 0, 5 } ++ // S-1-5-32-544
         [_]u8{ 0x20, 0, 0, 0 } ++ [_]u8{ 0x20, 0x02, 0, 0 };
     const everyone_sid = [_]u8{ 1, 1, 0, 0, 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 0 }; // S-1-1-0
@@ -347,7 +358,7 @@ pub fn writeSecurityDescriptor(w: *wire.Writer, requested: u32) Error!void {
         try w.u8_(0); // ACCESS_ALLOWED_ACE_TYPE
         try w.u8_(0x03); // OBJECT_INHERIT | CONTAINER_INHERIT
         try w.u16_(@intCast(ace_len));
-        try w.u32_(access_mask);
+        try w.u32_(granted);
         try w.blob(&everyone_sid);
     }
 }
@@ -476,7 +487,7 @@ test "the fixed-size file info classes are exactly the documented sizes" {
     for (cases) |case| {
         var buf: [128]u8 = undefined;
         var w = wire.Writer.init(&buf);
-        try writeFileInfo(&w, case.class, sampleMeta(), "name.txt", false);
+        try writeFileInfo(&w, case.class, sampleMeta(), .{ .name = "name.txt" });
         try testing.expectEqual(case.size, w.pos);
     }
 }
@@ -484,7 +495,7 @@ test "the fixed-size file info classes are exactly the documented sizes" {
 test "FileAllInformation is the concatenation clients expect" {
     var buf: [256]u8 = undefined;
     var w = wire.Writer.init(&buf);
-    try writeFileInfo(&w, .all, sampleMeta(), "ab", false);
+    try writeFileInfo(&w, .all, sampleMeta(), .{ .name = "ab" });
     const out = w.written();
     // Basic(40) + Standard(24) + Internal(8) + Ea(4) + Access(4) + Position(8)
     // + Mode(4) + Alignment(4) = 96, then the name.
@@ -499,7 +510,7 @@ test "standard info reports a directory and a pending delete" {
     var w = wire.Writer.init(&buf);
     var meta = sampleMeta();
     meta.attributes = .{ .directory = true };
-    try writeFileInfo(&w, .standard, meta, "", true);
+    try writeFileInfo(&w, .standard, meta, .{ .delete_pending = true });
     const out = w.written();
     try testing.expectEqual(@as(u8, 1), out[20]); // DeletePending
     try testing.expectEqual(@as(u8, 1), out[21]); // Directory
@@ -529,7 +540,7 @@ test "a read-only volume says so in its attributes" {
 test "the security descriptor is self-relative and internally consistent" {
     var buf: [128]u8 = undefined;
     var w = wire.Writer.init(&buf);
-    try writeSecurityDescriptor(&w, 0x7); // owner | group | dacl
+    try writeSecurityDescriptor(&w, 0x7, full_access); // owner | group | dacl
     const out = w.written();
 
     try testing.expectEqual(@as(u8, 1), out[0]);
@@ -550,7 +561,7 @@ test "the security descriptor is self-relative and internally consistent" {
 test "asking for only the owner leaves the DACL out entirely" {
     var buf: [128]u8 = undefined;
     var w = wire.Writer.init(&buf);
-    try writeSecurityDescriptor(&w, 0x1);
+    try writeSecurityDescriptor(&w, 0x1, full_access);
     const out = w.written();
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, out[16..20], .little));
     try testing.expect(std.mem.readInt(u16, out[2..4], .little) & 0x0004 == 0);

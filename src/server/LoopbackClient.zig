@@ -310,6 +310,10 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             lease_key: ?[16]u8 = null,
             /// Ask for a plain oplock instead, the way a 2.0.2 client does.
             oplock: u8 = 0,
+            /// "MxAc": ask what this account may do with the file.
+            maximal_access: bool = false,
+            /// "QFid": ask what the file is underneath its name.
+            disk_id: bool = false,
         };
 
         pub fn createBody(args: CreateArgs, out: []u8) []u8 {
@@ -334,24 +338,22 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             w.u32_(0) catch unreachable; // CreateContextsLength
             w.blob(name) catch unreachable;
 
+            // Contexts are chained: each says how far away the next one is,
+            // and each starts 8-aligned measured from the SMB2 header.
+            var previous: ?usize = null;
+            var first: usize = 0;
             if (args.lease_key) |key| {
-                // Contexts start 8-aligned, measured from the SMB2 header.
-                while ((64 + w.pos) % 8 != 0) w.u8_(0) catch unreachable;
-                const at = w.pos;
-                w.u32_(0) catch unreachable; // Next
-                w.u16_(16) catch unreachable; // NameOffset
-                w.u16_(4) catch unreachable; // NameLength
-                w.u16_(0) catch unreachable; // Reserved
-                w.u16_(24) catch unreachable; // DataOffset
-                w.u32_(32) catch unreachable; // DataLength
-                w.blob("RqLs") catch unreachable;
-                w.zeroes(4) catch unreachable;
+                openContext(&w, &previous, &first, "RqLs", 32);
                 w.blob(&key) catch unreachable;
                 w.u32_(0x0000_0007) catch unreachable; // LeaseState: read, handle and write
                 w.u32_(0) catch unreachable; // LeaseFlags
                 w.u64_(0) catch unreachable; // LeaseDuration
-                w.patchInt(u32, contexts_at, @intCast(64 + at)) catch unreachable;
-                w.patchInt(u32, contexts_at + 4, @intCast(w.pos - at)) catch unreachable;
+            }
+            if (args.maximal_access) openContext(&w, &previous, &first, "MxAc", 0);
+            if (args.disk_id) openContext(&w, &previous, &first, "QFid", 0);
+            if (previous != null) {
+                w.patchInt(u32, contexts_at, @intCast(64 + first)) catch unreachable;
+                w.patchInt(u32, contexts_at + 4, @intCast(w.pos - first)) catch unreachable;
             }
             return w.written();
         }
@@ -484,6 +486,26 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             return statusOf(c.send(.lock, w.written()));
         }
     };
+}
+
+/// Starts one create context, chained behind whatever came before it.
+fn openContext(w: *wire.Writer, previous: *?usize, first: *usize, name: []const u8, data_length: u32) void {
+    while ((64 + w.pos) % 8 != 0) w.u8_(0) catch unreachable;
+    const at = w.pos;
+    if (previous.*) |before| {
+        w.patchInt(u32, before, @intCast(at - before)) catch unreachable;
+    } else {
+        first.* = at;
+    }
+    previous.* = at;
+    w.u32_(0) catch unreachable; // Next
+    w.u16_(16) catch unreachable; // NameOffset
+    w.u16_(@intCast(name.len)) catch unreachable;
+    w.u16_(0) catch unreachable; // Reserved
+    w.u16_(24) catch unreachable; // DataOffset
+    w.u32_(data_length) catch unreachable;
+    w.blob(name) catch unreachable;
+    w.zeroes(8 - name.len) catch unreachable;
 }
 
 /// One range of a server-side copy.

@@ -446,6 +446,41 @@ test "set info: truncate, rename, and delete on close" {
     try testing.expectEqual(status.OBJECT_NAME_NOT_FOUND, c.client.open(.{ .path = "renamed.txt" }));
 }
 
+test "a handle is told what it was granted, not what everything would be" {
+    const c = try setup(.{}, "alice:" ++ password ++ "\nbob:" ++ password ++ ":ro");
+    defer c.destroy(testing.allocator);
+    _ = c.client.negotiate();
+    try testing.expectEqual(status.SUCCESS, c.client.login("bob", password, .raw, false));
+    try testing.expectEqual(status.SUCCESS, c.client.treeConnect("data"));
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt" }));
+
+    const granted = c.client.queryInfo(.file, @intFromEnum(info.FileClass.access));
+    const at = std.mem.readInt(u16, bodyOf(granted)[2..4], .little);
+    const mask = std.mem.readInt(u32, granted[at..][0..4], .little);
+    try testing.expect(mask & 0x0000_0001 != 0); // FILE_READ_DATA
+    try testing.expect(mask & 0x0000_0002 == 0); // FILE_WRITE_DATA
+}
+
+test "the permissions a client is shown are the ones it actually has" {
+    const c = try setup(.{}, "bob:" ++ password ++ ":ro");
+    defer c.destroy(testing.allocator);
+    _ = c.client.negotiate();
+    try testing.expectEqual(status.SUCCESS, c.client.login("bob", password, .raw, false));
+    try testing.expectEqual(status.SUCCESS, c.client.treeConnect("data"));
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{ .path = "notes.txt" }));
+
+    const security = c.client.queryInfo(.security, 0);
+    try testing.expectEqual(status.SUCCESS, statusOf(security));
+    const at = std.mem.readInt(u16, bodyOf(security)[2..4], .little);
+    const descriptor = security[at..];
+    // The one ACE's access mask sits four bytes into the ACE, which follows
+    // the eight-byte ACL header at the offset the descriptor names.
+    const dacl_at = std.mem.readInt(u32, descriptor[16..20], .little);
+    const mask = std.mem.readInt(u32, descriptor[dacl_at + 8 + 4 ..][0..4], .little);
+    try testing.expect(mask & 0x0000_0001 != 0); // FILE_READ_DATA
+    try testing.expect(mask & 0x0000_0002 == 0); // FILE_WRITE_DATA
+}
+
 test "a compound create + query_info + close in one frame" {
     const c = try loggedIn("alice");
     defer c.destroy(testing.allocator);
@@ -1244,6 +1279,120 @@ fn createWithLease(c: *Harness, path: []const u8, key: [16]u8, mask: u32) []cons
     }, &buf));
     if (statusOf(response) == status.SUCCESS) @memcpy(&c.client.file_id, response[64 + 64 ..][0..16]);
     return response;
+}
+
+/// Finds one create context in a CREATE response by name, and hands back its
+/// data. Walking the chain is the point: the server answers several at once.
+fn responseContext(response: []const u8, name: []const u8) ?[]const u8 {
+    const body = bodyOf(response);
+    const offset = std.mem.readInt(u32, body[create_contexts_offset_at..][0..4], .little);
+    const length = std.mem.readInt(u32, body[create_contexts_length_at..][0..4], .little);
+    if (length == 0) return null;
+
+    var at: usize = offset;
+    const end = offset + length;
+    while (at + 16 <= end) {
+        const chunk = response[at..end];
+        const next = std.mem.readInt(u32, chunk[0..4], .little);
+        const name_offset = std.mem.readInt(u16, chunk[4..6], .little);
+        const name_length = std.mem.readInt(u16, chunk[6..8], .little);
+        const data_offset = std.mem.readInt(u16, chunk[10..12], .little);
+        const data_length = std.mem.readInt(u32, chunk[12..16], .little);
+        if (std.mem.eql(u8, chunk[name_offset..][0..name_length], name)) {
+            return chunk[data_offset..][0..data_length];
+        }
+        if (next == 0) break;
+        at += next;
+    }
+    return null;
+}
+
+test "a client that asks what it may do is told, without opening the file again" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    var buf: [512]u8 = undefined;
+    const response = c.client.send(.create, Client.createBody(.{
+        .path = "notes.txt",
+        .maximal_access = true,
+    }, &buf));
+    try testing.expectEqual(status.SUCCESS, statusOf(response));
+
+    const context = responseContext(response, "MxAc") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 8), context.len);
+    try testing.expectEqual(status.SUCCESS, std.mem.readInt(u32, context[0..4], .little));
+    try testing.expectEqual(@as(u32, 0x001F_01FF), std.mem.readInt(u32, context[4..8], .little));
+}
+
+test "a read-only account is told it may only read" {
+    const c = try setup(.{}, "bob:" ++ password ++ ":ro");
+    defer c.destroy(testing.allocator);
+    _ = c.client.negotiate();
+    try testing.expectEqual(status.SUCCESS, c.client.login("bob", password, .raw, false));
+    try testing.expectEqual(status.SUCCESS, c.client.treeConnect("data"));
+
+    var buf: [512]u8 = undefined;
+    const response = c.client.send(.create, Client.createBody(.{
+        .path = "notes.txt",
+        .maximal_access = true,
+    }, &buf));
+    const context = responseContext(response, "MxAc") orelse return error.TestUnexpectedResult;
+    const granted = std.mem.readInt(u32, context[4..8], .little);
+    try testing.expect(granted & 0x0000_0002 == 0); // FILE_WRITE_DATA
+    try testing.expect(granted & 0x0000_0001 != 0); // FILE_READ_DATA
+}
+
+test "a client that asks what the file is gets the same id under either name" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    var buf: [512]u8 = undefined;
+    const first = c.client.send(.create, Client.createBody(.{ .path = "notes.txt", .disk_id = true }, &buf));
+    const one = responseContext(first, "QFid") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 32), one.len);
+    const file_id = std.mem.readInt(u64, one[0..8], .little);
+    const volume_id = std.mem.readInt(u64, one[8..16], .little);
+    try testing.expect(volume_id != 0);
+
+    const second = c.client.send(.create, Client.createBody(.{ .path = "notes.txt", .disk_id = true }, &buf));
+    const two = responseContext(second, "QFid") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(file_id, std.mem.readInt(u64, two[0..8], .little));
+
+    // And it is the same number the file reports about itself.
+    @memcpy(&c.client.file_id, second[64 + 64 ..][0..16]);
+    const internal = c.client.queryInfo(.file, @intFromEnum(info.FileClass.internal));
+    const record = bodyOf(internal)[8..];
+    try testing.expectEqual(file_id, std.mem.readInt(u64, record[0..8], .little));
+}
+
+test "two contexts asked for at once are both answered" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    var buf: [512]u8 = undefined;
+    const key: [16]u8 = @splat(0x5A);
+    const response = c.client.send(.create, Client.createBody(.{
+        .path = "notes.txt",
+        .lease_key = key,
+        .maximal_access = true,
+        .disk_id = true,
+    }, &buf));
+    try testing.expectEqual(status.SUCCESS, statusOf(response));
+
+    const lease = responseContext(response, "RqLs") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &key, lease[0..16]);
+    try testing.expect(responseContext(response, "MxAc") != null);
+    try testing.expect(responseContext(response, "QFid") != null);
+}
+
+test "a context nobody asked for is not sent" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    var buf: [512]u8 = undefined;
+    const response = c.client.send(.create, Client.createBody(.{ .path = "notes.txt" }, &buf));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bodyOf(response)[create_contexts_length_at..][0..4], .little));
+    try testing.expect(responseContext(response, "MxAc") == null);
 }
 
 test "a lease request is answered with read caching under the client's own key" {
