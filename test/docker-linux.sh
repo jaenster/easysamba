@@ -24,6 +24,16 @@ set -eu
 apk add --no-cache cifs-utils samba-client python3 >/dev/null 2>&1
 cd /work
 
+# A process that has just been killed can still be holding the mount when the
+# next line runs, and a busy unmount would fail the whole run for nothing.
+unmount_retry() {
+    for _ in 1 2 3 4 5; do
+        umount "$1" 2>/dev/null && return 0
+        sleep 1
+    done
+    umount "$1"
+}
+
 echo "=== kernel cifs client ==="
 DAEMON=/easysambad sh test/integration.sh
 
@@ -69,7 +79,7 @@ result=$(python3 /work/test/lockcheck.py /tmp/lockmnt/locked.txt)
 [ "$result" = "conflict" ] \
     && echo "  ok    a second process is refused the locked range" \
     || echo "  FAIL  second process saw: $result"
-umount /tmp/lockmnt
+unmount_retry /tmp/lockmnt
 
 echo
 echo "=== leases ==="
@@ -108,7 +118,8 @@ seen=$(cat /tmp/leasemnt/leased.txt)
     && echo "  ok    the client dropped what it had cached" \
     || echo "  FAIL  the client is still serving: $seen"
 kill $holder 2>/dev/null || true
-umount /tmp/leasemnt
+wait $holder 2>/dev/null || true
+unmount_retry /tmp/leasemnt
 
 echo
 echo "=== change notification ==="
