@@ -6,20 +6,21 @@
 //! ceiling is knowable before it runs rather than discovered under load.
 //!
 //! What it speaks: SMB 2.0.2 and 2.1, NTLMv2 authentication (never guest,
-//! never anonymous), HMAC-SHA256 signing, compounded requests, byte-range locks
-//! that are actually enforced against reads and writes, and read caching —
-//! leases for a 2.1 client, level-II oplocks for an older one — taken back with
-//! a break the moment somebody changes the file. Change notification is
-//! answered asynchronously, which is the one place a request outlives the frame
-//! that carried it, and a copy inside a share is done by the server rather than
-//! dragged through the client. What it deliberately does not: write or handle
-//! caching
-//! (both need a request parked half-answered while a client writes back or
-//! closes, and there is nowhere to park one), DFS, and SMB3 — the dialect list
-//! stops at 2.1 because
-//! every 3.x feature a client would then expect (signing over CMAC, negotiate
-//! contexts, preauth integrity, encryption) is a correctness cliff, not an
-//! optimisation.
+//! never anonymous), HMAC-SHA256 signing and compounded requests. Byte-range
+//! locks and share modes are enforced rather than acknowledged, so a client
+//! that asks for exclusive use of a file gets it. Read caching is granted —
+//! leases for a 2.1 client, level-II oplocks for an older one — and taken back
+//! with a break the moment somebody changes the file. Change notification is
+//! answered asynchronously, which is the one place a request outlives the
+//! frame that carried it, and a copy inside a share is made by the server
+//! rather than dragged through the client.
+//!
+//! What it deliberately does not: write or handle caching, both of which need
+//! a request parked half-answered while a client writes back or closes, and
+//! there is nowhere here to park one; DFS; and SMB3 — the dialect list stops
+//! at 2.1 because every 3.x feature a client would then expect (signing over
+//! CMAC, negotiate contexts, preauth integrity, encryption) is a correctness
+//! cliff, not an optimisation.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -129,6 +130,27 @@ const access = struct {
     fn wantsDelete(mask: u32) bool {
         return mask & (DELETE | DELETE_CHILD | GENERIC_ALL) != 0;
     }
+
+    // Sharing is decided on a narrower question than access is. Reading a
+    // file's timestamps is a read, but it is not the kind of read another
+    // handle means to keep out when it opens a file for exclusive use — MS-FSA
+    // weighs only the three that touch the contents.
+    fn opensForRead(mask: u32) bool {
+        return mask & (READ_DATA | EXECUTE | GENERIC_READ | GENERIC_EXECUTE | GENERIC_ALL) != 0;
+    }
+    fn opensForWrite(mask: u32) bool {
+        return mask & (WRITE_DATA | APPEND_DATA | GENERIC_WRITE | GENERIC_ALL) != 0;
+    }
+    fn opensForDelete(mask: u32) bool {
+        return mask & (DELETE | GENERIC_ALL) != 0;
+    }
+};
+
+/// What a CREATE is prepared to let other handles do while it is open.
+const share_access = struct {
+    const read: u32 = 0x0000_0001;
+    const write: u32 = 0x0000_0002;
+    const delete: u32 = 0x0000_0004;
 };
 
 const create_options = struct {
@@ -245,6 +267,13 @@ pub fn Server(comptime limits: Limits) type {
             can_read: bool = false,
             can_write: bool = false,
             delete_on_close: bool = false,
+            /// What this handle was opened for, and what it is prepared to let
+            /// another handle do at the same time. Both halves are kept
+            /// because a sharing decision needs each side of it: what the
+            /// newcomer wants against what everyone already there permits, and
+            /// what they already have against what the newcomer permits.
+            desired_access: u32 = 0,
+            share_access: u32 = 0,
 
             // Directory enumeration state. A client walks a directory across
             // several QUERY_DIRECTORY requests on one handle, so the position
@@ -1206,8 +1235,6 @@ pub fn Server(comptime limits: Limits) type {
                 .query_info => s.handleQueryInfo(ctx),
                 .set_info => s.handleSetInfo(ctx),
                 .lock => s.handleLock(ctx),
-                // Not supported, and saying so plainly is the point: a client
-                // that is told "no" falls back, a client left waiting hangs.
                 .change_notify => s.handleChangeNotify(ctx),
                 .ioctl => s.handleIoctl(ctx),
                 else => status.NOT_IMPLEMENTED,
@@ -1655,6 +1682,63 @@ pub fn Server(comptime limits: Limits) type {
 
         // ----------------------------------------------------------- create
 
+        /// Whether a new handle can be opened alongside the ones already on
+        /// this file, and if not, why not.
+        ///
+        /// A CREATE carries two things: what the client wants to do with the
+        /// file, and what it is prepared to let anyone else do while it holds
+        /// it. Both have to agree with every handle already open on the file,
+        /// in both directions — a newcomer that wants to write is refused by a
+        /// handle that did not permit writing, and a newcomer that permits
+        /// nothing is refused because of the writer already there. This is
+        /// what makes "the file is open in another program" possible; without
+        /// it the server accepts an exclusive open and then hands the file to
+        /// the next client that asks.
+        fn openConflict(
+            s: *const Self,
+            share_index: usize,
+            path_hash: u64,
+            path: []const u8,
+            wanted: u32,
+            sharing: u32,
+        ) u32 {
+            const wants_read = access.opensForRead(wanted);
+            const wants_write = access.opensForWrite(wanted);
+            const wants_delete = access.opensForDelete(wanted);
+
+            var taken = s.takenSlots();
+            var live = taken.iterator(.{});
+            while (live.next()) |index| {
+                const c = &s.conns[index];
+                if (!c.active) continue;
+                for (&c.sessions) |*session| {
+                    if (!session.active) continue;
+                    for (&session.opens) |*open| {
+                        if (!open.active) continue;
+                        if (open.share != share_index or open.path_hash != path_hash) continue;
+                        // The hash narrows it down; the path settles it, so
+                        // two files that happen to hash alike cannot lock each
+                        // other out.
+                        if (!std.mem.eql(u8, open.path_(), path)) continue;
+
+                        // A file on its way out is not opened again. The
+                        // handle that asked for the delete still has it, and
+                        // the name stops working the moment that handle goes.
+                        if (open.delete_on_close) return status.DELETE_PENDING;
+
+                        if (wants_read and open.share_access & share_access.read == 0) return status.SHARING_VIOLATION;
+                        if (wants_write and open.share_access & share_access.write == 0) return status.SHARING_VIOLATION;
+                        if (wants_delete and open.share_access & share_access.delete == 0) return status.SHARING_VIOLATION;
+
+                        if (access.opensForRead(open.desired_access) and sharing & share_access.read == 0) return status.SHARING_VIOLATION;
+                        if (access.opensForWrite(open.desired_access) and sharing & share_access.write == 0) return status.SHARING_VIOLATION;
+                        if (access.opensForDelete(open.desired_access) and sharing & share_access.delete == 0) return status.SHARING_VIOLATION;
+                    }
+                }
+            }
+            return status.SUCCESS;
+        }
+
         fn handleCreate(s: *Self, ctx: *Ctx) u32 {
             var r = wire.Reader.init(ctx.body);
             const structure_size = r.u16_() catch return status.INVALID_PARAMETER;
@@ -1666,7 +1750,7 @@ pub fn Server(comptime limits: Limits) type {
             _ = r.u64_() catch return status.INVALID_PARAMETER; // Reserved
             const desired_access = r.u32_() catch return status.INVALID_PARAMETER;
             const file_attributes = r.u32_() catch return status.INVALID_PARAMETER;
-            _ = r.u32_() catch return status.INVALID_PARAMETER; // ShareAccess
+            const sharing = r.u32_() catch return status.INVALID_PARAMETER;
             const disposition = r.u32_() catch return status.INVALID_PARAMETER;
             const options = r.u32_() catch return status.INVALID_PARAMETER;
             const name_offset = r.u16_() catch return status.INVALID_PARAMETER;
@@ -1704,6 +1788,11 @@ pub fn Server(comptime limits: Limits) type {
             if (options & create_options.DIRECTORY_FILE != 0) directory = true;
             if (options & create_options.NON_DIRECTORY_FILE != 0) directory = false;
 
+            const path_hash = std.hash.Wyhash.hash(0, path);
+            const wanted = desired_access | (if (wants_delete) access.DELETE else 0);
+            const conflict = s.openConflict(ctx.tree.?.share, path_hash, path, wanted, sharing);
+            if (conflict != status.SUCCESS) return conflict;
+
             const opened = share.open(path, .{
                 .read = access.wantsRead(desired_access) or !wants_write,
                 .write = wants_write,
@@ -1728,7 +1817,9 @@ pub fn Server(comptime limits: Limits) type {
             open.delete_on_close = options & create_options.DELETE_ON_CLOSE != 0;
             @memcpy(open.path[0..path.len], path);
             open.path_len = path.len;
-            open.path_hash = std.hash.Wyhash.hash(0, path);
+            open.path_hash = path_hash;
+            open.desired_access = wanted;
+            open.share_access = sharing;
 
             const granted = s.grantCaching(
                 ctx,

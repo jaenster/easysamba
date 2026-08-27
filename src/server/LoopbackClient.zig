@@ -301,6 +301,9 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             access_mask: u32 = 0x0012_0089,
             /// FILE_OPEN.
             disposition: u32 = 1,
+            /// What other handles may do meanwhile: read, write and delete,
+            /// which is what a client that does not care sends.
+            share_access: u32 = 7,
             options: u32 = 0,
             attributes: u32 = 0,
             /// Ask for a lease under this key, the way a 2.1 client does.
@@ -321,7 +324,7 @@ pub fn LoopbackClient(comptime ServerType: type) type {
             w.u64_(0) catch unreachable; // Reserved
             w.u32_(args.access_mask) catch unreachable;
             w.u32_(args.attributes) catch unreachable;
-            w.u32_(7) catch unreachable; // ShareAccess: read/write/delete
+            w.u32_(args.share_access) catch unreachable;
             w.u32_(args.disposition) catch unreachable;
             w.u32_(args.options) catch unreachable;
             w.u16_(64 + 56) catch unreachable; // NameOffset

@@ -919,6 +919,199 @@ const read_write: u32 = 0x0012_0089 | 0x0000_0116;
 const unlock = loopback.lock_flags.unlock;
 const shared = loopback.lock_flags.shared;
 
+// ------------------------------------------------------------------ sharing
+
+/// The three things a handle can let others go on doing.
+const share_read: u32 = 0x0001;
+const share_write: u32 = 0x0002;
+const share_delete: u32 = 0x0004;
+const share_none: u32 = 0;
+
+/// FILE_GENERIC_READ, which is what the client sends unless told otherwise.
+const read_only: u32 = 0x0012_0089;
+
+const delete_access: u32 = 0x0001_0000;
+
+test "a handle that permits nothing keeps the next open out" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_write,
+        .share_access = share_none,
+    }));
+    try testing.expectEqual(status.SHARING_VIOLATION, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_only,
+        .share_access = 7,
+    }));
+}
+
+test "two readers that both permit reading are both let in" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_only,
+        .share_access = share_read,
+    }));
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_only,
+        .share_access = share_read,
+    }));
+}
+
+test "a writer is refused while a handle that permits only reading is open" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_only,
+        .share_access = share_read,
+    }));
+    try testing.expectEqual(status.SHARING_VIOLATION, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_write,
+        .share_access = share_read | share_write,
+    }));
+}
+
+test "a reader that permits nothing is refused because of the reader already there" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    // Nothing the newcomer wants is denied; what it refuses to allow is what
+    // the handle already open is doing.
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_only,
+        .share_access = 7,
+    }));
+    try testing.expectEqual(status.SHARING_VIOLATION, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_only,
+        .share_access = share_none,
+    }));
+}
+
+test "a delete is refused while a handle that did not permit one is open" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_only,
+        .share_access = share_read | share_write,
+    }));
+    try testing.expectEqual(status.SHARING_VIOLATION, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = delete_access,
+        .share_access = 7,
+    }));
+}
+
+test "the file next to it is not affected" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_write,
+        .share_access = share_none,
+    }));
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "docs/report.pdf",
+        .access_mask = read_write,
+        .share_access = share_none,
+    }));
+}
+
+test "sharing is decided across sessions, not within one" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_write,
+        .share_access = share_none,
+    }));
+
+    // A second login on the same connection is a different client as far as
+    // the file is concerned. It borrows the connection rather than taking a
+    // slot of its own, which would close the one holding the handle.
+    var other = c.client;
+    other.session_id = 0;
+    other.tree_id = 0;
+    try testing.expectEqual(status.SUCCESS, other.login("alice", password, .raw, false));
+    try testing.expectEqual(status.SUCCESS, other.treeConnect("data"));
+    try testing.expectEqual(status.SHARING_VIOLATION, other.open(.{
+        .path = "notes.txt",
+        .access_mask = read_only,
+    }));
+}
+
+test "a file on its way out is not opened again" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = delete_access,
+    }));
+    try testing.expectEqual(status.SUCCESS, statusOf(c.client.setInfo(.disposition, &.{1})));
+
+    var other = c.client;
+    other.session_id = 0;
+    other.tree_id = 0;
+    try testing.expectEqual(status.SUCCESS, other.login("alice", password, .raw, false));
+    try testing.expectEqual(status.SUCCESS, other.treeConnect("data"));
+    try testing.expectEqual(status.DELETE_PENDING, other.open(.{ .path = "notes.txt" }));
+
+    // And once the handle goes, so does the name.
+    _ = c.client.closeFile();
+    try testing.expectEqual(status.OBJECT_NAME_NOT_FOUND, other.open(.{ .path = "notes.txt" }));
+}
+
+test "the next open goes through once the handle is closed" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_write,
+        .share_access = share_none,
+    }));
+    _ = c.client.closeFile();
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_write,
+        .share_access = share_none,
+    }));
+}
+
+test "reading attributes is not the kind of read a handle keeps out" {
+    const c = try loggedIn("alice");
+    defer c.destroy(testing.allocator);
+
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = read_write,
+        .share_access = share_none,
+    }));
+    // FILE_READ_ATTRIBUTES and nothing else: what a client asks for when it
+    // wants a listing entry, not the contents. The handle already there
+    // permits nothing, and this is let in anyway.
+    try testing.expectEqual(status.SUCCESS, c.client.open(.{
+        .path = "notes.txt",
+        .access_mask = 0x0000_0080,
+        .share_access = 7,
+    }));
+}
+
 /// Opens the same file twice and hands back both handles, which is the only
 /// interesting case for locking: a lock exists to be seen by someone else.
 fn twoHandles(c: *Harness) ![2][16]u8 {
